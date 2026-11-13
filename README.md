@@ -42,12 +42,16 @@ Action fields (all types): `schema`, `type`, `feature`, `action_id`, `revision`,
 
 | `type` | Text field | Extra | Terminal |
 | --- | --- | --- | --- |
-| `llm_task` | `prompt` | | no |
-| `ask` | `question` | `nonce` | no |
-| `confirm` | `question` | `nonce` | no |
+| `llm_task` | `prompt_file` | | no |
+| `ask` | `question` | `header`, `options`, `nonce` | no |
+| `confirm` | `question` | `header`, `options`, `nonce` | no |
 | `instruct_agent` | `instruction` | | no |
 | `report` | `summary` | | yes |
 | `done` | `summary` | | yes |
+
+An `llm_task` does not carry its prompt inline. `prompt_file` is a POSIX path, relative to the project root, of `.archshell/state/prompts/<action_id>.md`, which the engine writes before it replies and which holds the prompt with line endings normalized to LF, UTF-8 without BOM. The file stays while the task is pending; a repeated `next` returns the same `prompt_file` and rewrites the file only if it is missing or differs from the prompt.
+
+An `ask` or `confirm` also carries the question text the host shows, written by the engine: `header` (non-blank, at most 12 characters) and `options` (2 to 4 unique, non-blank labels). The host never writes its own question text. For `confirm`, the first option confirms and every other option declines. An `ask` or `confirm` without valid `header` and `options` is not a valid action.
 
 A submit echoes `feature`, `action_id`, and `revision`, and carries `result` (an object). For `ask` and `confirm` it also echoes the issued `nonce` and sets `source: "human_ui"`; only the host's native question tool may produce that. A submit never carries a verdict.
 
@@ -80,7 +84,7 @@ On Windows machines where Application Control (Smart App Control) blocks unsigne
 
 ## Install the Claude Code plugin from the local marketplace
 
-The plugin runs `archshell-engine` from `PATH`, so install the core first:
+The plugin runs `archshell-engine` from `PATH` unless the `ARCHSHELL_ENGINE` environment variable is set, in which case every engine call uses that command instead. Install the core first:
 
 ```sh
 uv tool install --editable ./archshell-core
@@ -94,3 +98,40 @@ Then, in Claude Code:
 ```
 
 Restart Claude Code if asked, then run `/archshell:ping`. It shows the first action of the `probe` flow (`llm_task`). It writes cursor state under `.archshell/` in the working directory, so repeated pings show the same action.
+
+### Override the engine command
+
+On machines where the `archshell-engine` launcher cannot run (for example under Application Control), set `ARCHSHELL_ENGINE` before starting Claude Code to the module form, pointing at this checkout:
+
+```sh
+export ARCHSHELL_ENGINE="uv run --project C:\git\arch-shell python -m archshell.engine"
+```
+
+```powershell
+$env:ARCHSHELL_ENGINE = "uv run --project C:\git\arch-shell python -m archshell.engine"
+```
+
+`/archshell:ping` and `/archshell:run` both use it.
+
+### Run a flow: `/archshell:run <feature>`
+
+`/archshell:run probe` drives the engine loop inside Claude Code: `next`, execute the action, `submit` the result, until `done` or `report`. Every submit goes to the engine on stdin. The plugin holds no workflow logic; all user-facing text comes from the engine.
+
+| Action | How the plugin executes it | `result` it submits |
+| --- | --- | --- |
+| `llm_task` | a fresh `archshell:archshell-task` agent, given only the prompt file's absolute path (project root joined with `prompt_file`); the agent reads the file and answers | `{"text": <agent answer>}` |
+| `ask` | Claude Code's native question tool (`AskUserQuestion`), showing the action's `question`, `header`, and `options` verbatim, plus free text | `{"answer": <chosen option or typed text>}`, plus the action's `nonce` and `source: "human_ui"` |
+| `confirm` | the native question tool, showing the action's `question`, `header`, and `options` verbatim | `{"confirmed": true\|false}` (`true` for the first option), plus the action's `nonce` and `source: "human_ui"` |
+| `instruct_agent` | the session agent carries the instruction out | `{"status": "done"}` |
+| `report`, `done` | `summary` shown verbatim; the loop ends | nothing |
+
+An `archshell/error/v1` reply stops the loop and shows its `code` and `message`; nothing is retried. An unknown action type also stops the loop with a visible error.
+
+Try both built-in flows:
+
+```text
+/archshell:run probe          # agent task, question, confirmation, instruction, then the done summary
+/archshell:run probe-report   # agent task, then the report summary
+```
+
+Cursor state persists under `.archshell/` in the working directory, so a finished flow keeps returning its terminal action; delete `.archshell/state/<feature>.yaml` to run it again.
