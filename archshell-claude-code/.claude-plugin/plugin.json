@@ -1,0 +1,8 @@
+{
+  "name": "archshell",
+  "version": "0.1.0",
+  "description": "ArchShell host plugin for Claude Code. Holds no logic: it forwards to archshell-engine.",
+  "author": {
+    "name": "Antonio"
+  }
+}

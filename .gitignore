@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+dist/
+
+# .NET
+bin/
+obj/
+*.nupkg
+
+# Editors
+.vs/
+.vscode/
+.idea/

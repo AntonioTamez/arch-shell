@@ -1,0 +1,16 @@
+{
+  "name": "arch-shell",
+  "owner": {
+    "name": "Antonio"
+  },
+  "metadata": {
+    "description": "Local marketplace for the ArchShell Claude Code plugin."
+  },
+  "plugins": [
+    {
+      "name": "archshell",
+      "source": "./archshell-claude-code",
+      "description": "ArchShell host plugin for Claude Code."
+    }
+  ]
+}
