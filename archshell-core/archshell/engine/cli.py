@@ -2,6 +2,8 @@
 
 Protocol messages are JSON over stdin/stdout, UTF-8, one message per
 invocation. stdout carries only the protocol; logs go to stderr as JSON lines.
+Usage: `archshell-engine <command> --feature <slug>`; the project root is the
+working directory.
 """
 
 from __future__ import annotations
@@ -9,10 +11,19 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
-ACTION_PROTOCOL = "archshell/action/v1"
-ERROR_PROTOCOL = "archshell/error/v1"
+from archshell.adapters.ids import fresh_ids
+from archshell.adapters.state_store import (
+    CorruptState,
+    LockHeld,
+    RevisionConflict,
+    StateStore,
+)
+from archshell.domain import workflow
+
+ERROR_SCHEMA = "archshell/error/v1"
 
 EXIT_OK = 0
 EXIT_PROTOCOL_ERROR = 2
@@ -29,7 +40,7 @@ class ProtocolError(Exception):
 
     def to_message(self) -> Message:
         return {
-            "protocol": ERROR_PROTOCOL,
+            "schema": ERROR_SCHEMA,
             "code": self.code,
             "message": self.message,
             "details": self.details,
@@ -49,13 +60,74 @@ def read_message(stream: BinaryIO) -> Message:
     return message
 
 
-def cmd_next(message: Message) -> Message:
-    del message  # The tracer ignores input; story 1.2 reads state from disk.
-    return {"protocol": ACTION_PROTOCOL, "type": "done"}
+def refuse(refusal: workflow.Refusal) -> ProtocolError:
+    return ProtocolError(refusal.code, refusal.message, refusal.details)
 
 
-COMMANDS: dict[str, Callable[[Message], Message]] = {
+def parse_feature(args: Sequence[str]) -> str:
+    if len(args) < 2 or args[0] != "--feature":
+        raise ProtocolError("invalid_feature", "expected --feature <slug>")
+    if len(args) > 2:
+        raise ProtocolError(
+            "invalid_arguments", "unexpected arguments", {"arguments": list(args[2:])}
+        )
+    feature = args[1]
+    if not workflow.is_valid_slug(feature):
+        raise ProtocolError(
+            "invalid_feature",
+            f"feature must be a kebab-case slug of at most {workflow.SLUG_MAX_LENGTH} characters",
+            {"feature": feature},
+        )
+    return feature
+
+
+def require_flow(feature: str) -> None:
+    if feature not in workflow.FLOWS:
+        raise ProtocolError(
+            "unknown_feature",
+            f"no workflow for feature: {feature}",
+            {"features": sorted(workflow.FLOWS)},
+        )
+
+
+def cmd_next(feature: str, message: Message, store: StateStore) -> Message:
+    del message  # `next` takes no input; everything comes from the state on disk.
+    require_flow(feature)
+    with store.locked(feature):
+        state = store.read(feature)
+        outcome = workflow.on_next(state, feature, fresh_ids())
+        if isinstance(outcome, workflow.Refusal):
+            raise refuse(outcome)
+        if outcome.changed:
+            store.write(outcome.state, expected_revision=0 if state is None else state.revision)
+    return outcome.action.to_message()
+
+
+def cmd_submit(feature: str, message: Message, store: StateStore) -> Message:
+    submission = workflow.parse_submission(message)
+    if isinstance(submission, workflow.Refusal):
+        raise refuse(submission)
+    if submission.feature != feature:
+        raise ProtocolError(
+            "invalid_feature",
+            "submit message feature does not match --feature",
+            {"feature": feature, "message_feature": submission.feature},
+        )
+    require_flow(feature)
+    with store.locked(feature):
+        state = store.read(feature)
+        outcome = workflow.on_submit(state, submission, fresh_ids())
+        if isinstance(outcome, workflow.Refusal):
+            raise refuse(outcome)
+        assert state is not None  # on_submit refuses when there is no state
+        store.write(outcome.state, expected_revision=state.revision)
+    log("submit_accepted", feature=feature, revision=outcome.state.revision)
+    return outcome.action.to_message()
+
+
+COMMANDS: dict[str, Callable[[str, Message, StateStore], Message]] = {
     "next": cmd_next,
+    "submit": cmd_submit,
 }
 
 
@@ -69,7 +141,9 @@ def emit(message: Message, stdout: TextIO) -> None:
     stdout.flush()
 
 
-def run(argv: Sequence[str], stdin: BinaryIO, stdout: TextIO) -> int:
+def run(
+    argv: Sequence[str], stdin: BinaryIO, stdout: TextIO, root: Path | None = None
+) -> int:
     try:
         if not argv:
             raise ProtocolError(
@@ -83,7 +157,23 @@ def run(argv: Sequence[str], stdin: BinaryIO, stdout: TextIO) -> int:
                 f"unknown command: {name}",
                 {"commands": sorted(COMMANDS)},
             )
-        result = handler(read_message(stdin))
+        feature = parse_feature(argv[1:])
+        message = read_message(stdin)
+        store = StateStore(Path.cwd() if root is None else root)
+        try:
+            result = handler(feature, message, store)
+        except LockHeld:
+            raise ProtocolError(
+                "locked", "another engine invocation holds this feature's lock",
+                {"lock": f".archshell/locks/{feature}.lock"},
+            ) from None
+        except RevisionConflict as exc:
+            raise ProtocolError("stale_action", f"state changed concurrently: {exc}") from None
+        except CorruptState:
+            raise ProtocolError(
+                "invalid_state", "the feature's state file is unreadable",
+                {"state": f".archshell/state/{feature}.yaml"},
+            ) from None
     except ProtocolError as err:
         log("protocol_error", code=err.code)
         emit(err.to_message(), stdout)
