@@ -1,3 +1,6 @@
+# ArchShell engine state when run from the repo root (smoke tests, /archshell:ping)
+.archshell/
+
 # Python
 __pycache__/
 *.py[cod]

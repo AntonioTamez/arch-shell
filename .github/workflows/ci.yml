@@ -35,9 +35,9 @@ jobs:
 
       - name: engine smoke (console script)
         run: |
-          out="$(echo '{}' | uv run archshell-engine next)"
+          out="$(echo '{}' | uv run archshell-engine next --feature probe)"
           echo "$out"
-          test "$out" = '{"protocol":"archshell/action/v1","type":"done"}'
+          uv run python -c 'import json, sys; m = json.loads(sys.argv[1]); assert (m["schema"], m["type"], m["revision"]) == ("archshell/action/v1", "llm_task", 1), m' "$out"
           uv run archshell --version
 
       - name: build analyzer
