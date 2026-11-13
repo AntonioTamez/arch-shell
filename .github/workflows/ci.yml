@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: uv sync
+        run: uv sync --locked
+
+      - name: pytest
+        run: uv run pytest
+
+      - name: engine smoke (console script)
+        run: |
+          out="$(echo '{}' | uv run archshell-engine next)"
+          echo "$out"
+          test "$out" = '{"protocol":"archshell/action/v1","type":"done"}'
+          uv run archshell --version
+
+      - name: build analyzer
+        run: dotnet build archshell-dotnet/analyzer --configuration Release
+
+      - name: pack analyzer
+        run: dotnet pack archshell-dotnet/analyzer --configuration Release --no-build
+
+      - name: run analyzer
+        run: dotnet run --no-build --configuration Release --project archshell-dotnet/analyzer
