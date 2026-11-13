@@ -2,7 +2,9 @@
 
 State lives at `<root>/.archshell/state/<slug>.yaml`, serialized as sorted-key
 JSON (a YAML subset) until the canonical YAML emitter exists. The lock is
-`<root>/.archshell/locks/<slug>.lock`, taken by exclusive create.
+`<root>/.archshell/locks/<slug>.lock`, taken by exclusive create. The prompt
+of a pending `llm_task` lives beside the state, at the project-relative path
+the action names (`.archshell/state/prompts/<action_id>.md`).
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from archshell.domain.workflow import CursorState, StateError
+from archshell.domain.workflow import CursorState, PromptFile, StateError
 
 
 class LockHeld(Exception):
@@ -39,6 +41,30 @@ class StateStore:
 
     def state_path(self, feature: str) -> Path:
         return self.root / ".archshell" / "state" / f"{feature}.yaml"
+
+    def prompt_path(self, prompt: PromptFile) -> Path:
+        return self.root.joinpath(*prompt.path.split("/"))
+
+    def ensure_prompt(self, state: CursorState) -> None:
+        """Hold the pending action's prompt file on disk (LF-normalized, UTF-8, no BOM).
+
+        Writes only when the file is missing or differs. Call only while holding
+        `locked(state.feature)`.
+        """
+        prompt = state.pending_prompt()
+        if prompt is None:
+            return
+        path = self.prompt_path(prompt)
+        data = prompt.text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+        try:
+            if path.read_bytes() == data:
+                return
+        except FileNotFoundError:
+            pass
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
 
     def lock_path(self, feature: str) -> Path:
         return self.root / ".archshell" / "locks" / f"{feature}.lock"

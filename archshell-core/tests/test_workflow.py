@@ -65,13 +65,16 @@ def test_closed_action_set():
 
 
 def test_actions_are_immutable():
-    action = LlmTask(feature="probe", action_id="a", revision=1, prompt="p")
+    action = LlmTask(feature="probe", action_id="a", revision=1, prompt_file="p")
     with pytest.raises(dataclasses.FrozenInstanceError):
         action.revision = 2  # type: ignore[misc]
 
 
 def test_to_message_carries_common_fields_and_nonce():
-    ask = Ask(feature="probe", action_id="a", revision=2, question="q", nonce="n")
+    ask = Ask(
+        feature="probe", action_id="a", revision=2, question="q",
+        header="H", options=("Yes", "No"), nonce="n",
+    )
     assert ask.to_message() == {
         "schema": "archshell/action/v1",
         "type": "ask",
@@ -79,6 +82,8 @@ def test_to_message_carries_common_fields_and_nonce():
         "action_id": "a",
         "revision": 2,
         "question": "q",
+        "header": "H",
+        "options": ["Yes", "No"],
         "nonce": "n",
     }
     assert "nonce" not in Done(feature="probe", action_id="a", revision=1, summary="s").to_message()
@@ -86,7 +91,8 @@ def test_to_message_carries_common_fields_and_nonce():
 
 @pytest.mark.parametrize("cls", list(ACTION_TYPES.values()))
 def test_action_message_round_trip(cls):
-    values = {f.name: ("x" if f.type == "str" else 3) for f in dataclasses.fields(cls)}
+    sample = {"str": "x", "int": 3, "tuple[str, ...]": ("a", "b")}
+    values = {f.name: sample[f.type] for f in dataclasses.fields(cls)}
     action = cls(**values)
     assert action_from_message(action.to_message()) == action
 
@@ -110,6 +116,70 @@ def test_action_from_message_rejects_invalid(message):
         action_from_message(message)
 
 
+def question_message(type_: str = "ask", **changes) -> dict:
+    message = {
+        "schema": "archshell/action/v1", "type": type_, "feature": "p", "action_id": "a",
+        "revision": 1, "question": "q", "header": "Probe", "options": ["Yes", "No"],
+        "nonce": "n",
+    }
+    message.update(changes)
+    return {k: v for k, v in message.items() if v is not ...}
+
+
+@pytest.mark.parametrize("type_", ["ask", "confirm"])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"header": ...},
+        {"options": ...},
+        {"header": ""},
+        {"header": "x" * 13},
+        {"header": 1},
+        {"options": ["Yes"]},
+        {"options": ["a", "b", "c", "d", "e"]},
+        {"options": ["Yes", ""]},
+        {"options": ["Yes", "   "]},
+        {"options": ["Yes", "Yes"]},
+        {"options": ["Yes", "No", "Yes"]},
+        {"header": "   "},
+        {"header": "	"},
+        {"options": ["Yes", 1]},
+        {"options": "Yes,No"},
+        {"options": None},
+    ],
+)
+def test_question_actions_without_valid_header_and_options_are_invalid(type_, changes):
+    with pytest.raises(ActionError):
+        action_from_message(question_message(type_, **changes))
+
+
+@pytest.mark.parametrize("type_", ["ask", "confirm"])
+@pytest.mark.parametrize(
+    "changes",
+    [{}, {"header": "x" * 12}, {"options": ["a", "b", "c", "d"]}, {"options": ["a", "b", "c"]}],
+)
+def test_question_actions_with_valid_header_and_options_round_trip(type_, changes):
+    message = question_message(type_, **changes)
+    action = action_from_message(message)
+    assert isinstance(action.options, tuple)  # type: ignore[union-attr]
+    assert action.to_message() == message
+
+
+def test_probe_questions_carry_engine_header_and_options():
+    outcomes = drive("probe")
+    ask, confirm = outcomes[1].action, outcomes[2].action
+    assert (ask.type, ask.header, ask.options) == ("ask", "Probe", ("Yes", "No"))
+    assert (confirm.type, confirm.header, confirm.options) == (
+        "confirm", "Probe", ("Confirm", "Decline")
+    )
+    for flow in workflow.FLOWS.values():
+        for step in flow:
+            if step.type in ("ask", "confirm"):
+                assert 0 < len(step.header) <= 12 and 2 <= len(step.options) <= 4
+            else:
+                assert step.header == "" and step.options == ()
+
+
 def test_probe_flow_sequence_and_revisions():
     outcomes = drive("probe")
     assert [(o.action.type, o.action.revision) for o in outcomes] == [
@@ -118,6 +188,30 @@ def test_probe_flow_sequence_and_revisions():
     assert all(o.changed for o in outcomes)
     assert [o.action.action_id for o in outcomes] == ["id-1", "id-2", "id-3", "id-4", "id-5"]
     assert outcomes[1].action.nonce == "nonce-2"
+
+
+def test_llm_task_carries_prompt_file_not_prompt_text():
+    first = start().action
+    assert isinstance(first, LlmTask)
+    message = first.to_message()
+    assert "prompt" not in message
+    assert message["prompt_file"] == ".archshell/state/prompts/id-1.md"
+
+
+def test_pending_prompt_is_the_step_text():
+    first = start()
+    prompt = first.state.pending_prompt()
+    assert prompt == workflow.PromptFile(
+        ".archshell/state/prompts/id-1.md", workflow.FLOWS["probe"][0].text
+    )
+    asked = on_submit(first.state, good(first.action), ids(2))
+    assert isinstance(asked, Outcome) and asked.state.pending_prompt() is None
+
+
+@pytest.mark.parametrize("action_id", ["", "../x", "a/b", "a.b", "-a", "a" * 129, None])
+def test_prompt_file_for_rejects_unsafe_action_ids(action_id):
+    with pytest.raises(ValueError):
+        workflow.prompt_file_for(action_id)  # type: ignore[arg-type]
 
 
 def test_probe_report_flow_ends_with_report():
@@ -213,6 +307,11 @@ def test_state_round_trip():
         lambda d: d.update(extra=1),
         lambda d: d["action"].update(type="done"),
         lambda d: d.pop("action"),
+        lambda d: d["action"].update(prompt_file="../../outside.md"),
+        lambda d: d["action"].update(prompt_file=".archshell/state/prompts/other.md"),
+        lambda d: d["action"].update(
+            action_id="../x", prompt_file=".archshell/state/prompts/../x.md"
+        ),
     ],
 )
 def test_state_from_dict_rejects_invalid(mutate):

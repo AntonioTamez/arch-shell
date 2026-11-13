@@ -34,6 +34,11 @@ SUBMIT_FIELDS = frozenset(
 SLUG_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 SLUG_MAX_LENGTH = 64
 
+# `llm_task` prompts live beside cursor state, one file per action id. The path
+# is POSIX and relative to the project root; the engine writes the file.
+PROMPTS_DIR = ".archshell/state/prompts"
+ACTION_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}")
+
 
 def is_valid_slug(value: Any) -> bool:
     return (
@@ -55,6 +60,9 @@ class FreshIds:
 class Step:
     type: str
     text: str
+    # `ask`/`confirm` only: engine-written question header and option labels.
+    header: str = ""
+    options: tuple[str, ...] = ()
 
 
 # Built-in diagnostic flows; the feature slug selects the flow until real
@@ -62,8 +70,18 @@ class Step:
 FLOWS: dict[str, tuple[Step, ...]] = {
     "probe": (
         Step("llm_task", "Probe: reply with one short sentence confirming you received this task."),
-        Step("ask", "Probe: is the ArchShell action protocol reaching you?"),
-        Step("confirm", "Probe: confirm to continue the protocol probe."),
+        Step(
+            "ask",
+            "Probe: is the ArchShell action protocol reaching you?",
+            header="Probe",
+            options=("Yes", "No"),
+        ),
+        Step(
+            "confirm",
+            "Probe: confirm to continue the protocol probe.",
+            header="Probe",
+            options=("Confirm", "Decline"),
+        ),
         Step("instruct_agent", "Probe: no change is needed; acknowledge this instruction."),
         Step("done", "Probe finished: every action type was exchanged."),
     ),
@@ -74,15 +92,39 @@ FLOWS: dict[str, tuple[Step, ...]] = {
 }
 
 
+def is_valid_action_id(value: Any) -> bool:
+    """An action id is safe to use as a file name (it names the prompt file)."""
+    return isinstance(value, str) and ACTION_ID_PATTERN.fullmatch(value) is not None
+
+
+def prompt_file_for(action_id: str) -> str:
+    """The project-relative POSIX path of an `llm_task`'s prompt file."""
+    if not is_valid_action_id(action_id):
+        raise ValueError(f"action id is not usable as a file name: {action_id!r}")
+    return f"{PROMPTS_DIR}/{action_id}.md"
+
+
 def build_action(step: Step, feature: str, revision: int, ids: FreshIds) -> Action:
     common = {"feature": feature, "action_id": ids.action_id, "revision": revision}
     match step.type:
         case "llm_task":
-            return LlmTask(**common, prompt=step.text)
+            return LlmTask(**common, prompt_file=prompt_file_for(ids.action_id))
         case "ask":
-            return Ask(**common, question=step.text, nonce=ids.nonce)
+            return Ask(
+                **common,
+                question=step.text,
+                header=step.header,
+                options=step.options,
+                nonce=ids.nonce,
+            )
         case "confirm":
-            return Confirm(**common, question=step.text, nonce=ids.nonce)
+            return Confirm(
+                **common,
+                question=step.text,
+                header=step.header,
+                options=step.options,
+                nonce=ids.nonce,
+            )
         case "instruct_agent":
             return InstructAgent(**common, instruction=step.text)
         case "report":
@@ -94,6 +136,14 @@ def build_action(step: Step, feature: str, revision: int, ids: FreshIds) -> Acti
 
 class StateError(ValueError):
     """A serialized cursor state is not a valid `archshell/state/v1` document."""
+
+
+@dataclass(frozen=True)
+class PromptFile:
+    """A prompt the engine must hold on disk before it returns an `llm_task`."""
+
+    path: str
+    text: str
 
 
 @dataclass(frozen=True)
@@ -109,6 +159,12 @@ class CursorState:
     @property
     def ended(self) -> bool:
         return self.action.terminal
+
+    def pending_prompt(self) -> PromptFile | None:
+        """The prompt file the pending action points at, or None if it has none."""
+        if not isinstance(self.action, LlmTask):
+            return None
+        return PromptFile(self.action.prompt_file, FLOWS[self.flow][self.step].text)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -150,6 +206,11 @@ class CursorState:
             or action.type != FLOWS[flow][step].type
         ):
             raise StateError("pending action does not match the cursor")
+        if isinstance(action, LlmTask) and (
+            not is_valid_action_id(action.action_id)
+            or action.prompt_file != prompt_file_for(action.action_id)
+        ):
+            raise StateError("pending llm_task prompt_file does not match its action id")
         return CursorState(feature, flow, step, revision, action)
 
 
