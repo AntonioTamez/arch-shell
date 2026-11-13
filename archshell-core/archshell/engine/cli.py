@@ -40,7 +40,7 @@ def read_message(stream: BinaryIO) -> Message:
     raw = stream.read()
     try:
         message = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ProtocolError(
             "invalid_message", f"stdin is not a UTF-8 JSON message: {exc}"
         ) from None

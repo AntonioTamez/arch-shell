@@ -21,7 +21,7 @@ Requirements: [uv](https://docs.astral.sh/uv/), Python 3.12 or later, .NET SDK 1
 ```sh
 uv sync --locked
 uv run pytest
-echo {} | uv run archshell-engine next     # {"protocol":"archshell/action/v1","type":"done"}
+echo '{}' | uv run archshell-engine next     # {"protocol":"archshell/action/v1","type":"done"}
 uv run archshell --version
 dotnet build archshell-dotnet/analyzer
 dotnet run --project archshell-dotnet/analyzer
@@ -29,7 +29,7 @@ dotnet run --project archshell-dotnet/analyzer
 
 The engine speaks JSON over stdin/stdout, one message per invocation. stdout carries only the protocol; logs go to stderr as JSON lines. Errors are `archshell/error/v1` messages with exit code 2.
 
-On Windows machines where Application Control (Smart App Control) blocks unsigned executables, the uv launchers (`pytest.exe`, `archshell-engine.exe`) and the analyzer build output cannot start. Use the module forms instead: `uv run python -m pytest`, `uv run python -m archshell.engine next`.
+On Windows machines where Application Control (Smart App Control) blocks unsigned executables, the uv launchers (`pytest.exe`, `archshell-engine.exe`) and the analyzer build output cannot start. Use the module forms instead: `uv run python -m pytest`, `echo '{}' | uv run python -m archshell.engine next`.
 
 ## Install the Claude Code plugin from the local marketplace
 

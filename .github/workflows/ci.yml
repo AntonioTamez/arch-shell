@@ -43,5 +43,8 @@ jobs:
       - name: build analyzer
         run: dotnet build archshell-dotnet/analyzer --configuration Release
 
+      - name: pack analyzer
+        run: dotnet pack archshell-dotnet/analyzer --configuration Release --no-build
+
       - name: run analyzer
         run: dotnet run --no-build --configuration Release --project archshell-dotnet/analyzer

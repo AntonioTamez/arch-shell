@@ -44,7 +44,9 @@ def test_next_happy_path_returns_done():
     assert proc.stdout == b'{"protocol":"archshell/action/v1","type":"done"}\n'
 
 
-@pytest.mark.parametrize("payload", [b"not json", b"[]", b"", b"\xff\xfe"])
+@pytest.mark.parametrize(
+    "payload", [b"not json", b"[]", b"", b"\xff\xfe", b"[" * 100000]
+)
 def test_next_bad_json_is_invalid_message(payload):
     proc = run(ENGINE + ["next"], payload)
     assert proc.returncode == 2
