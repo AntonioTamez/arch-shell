@@ -13,18 +13,18 @@ The engine command is the value of the `ARCHSHELL_ENGINE` environment variable w
 Every message goes to the engine on stdin through a quoted heredoc, never as a command-line argument. Run each call with the Bash tool from the project root, exactly in this form:
 
 ```sh
-${ARCHSHELL_ENGINE:-archshell-engine} next --feature '<slug>' <<'ARCHSHELL_MESSAGE'
+${ARCHSHELL_ENGINE:-archshell-engine} next --feature '<slug>' 2>>"${TMPDIR:-/tmp}/archshell-engine.log" <<'ARCHSHELL_MESSAGE'
 {}
 ARCHSHELL_MESSAGE
 ```
 
 ```sh
-${ARCHSHELL_ENGINE:-archshell-engine} submit --feature '<slug>' <<'ARCHSHELL_MESSAGE'
+${ARCHSHELL_ENGINE:-archshell-engine} submit --feature '<slug>' 2>>"${TMPDIR:-/tmp}/archshell-engine.log" <<'ARCHSHELL_MESSAGE'
 <submit message as one line of JSON>
 ARCHSHELL_MESSAGE
 ```
 
-The engine prints exactly one JSON object on stdout. Logs on stderr are not part of the reply.
+The engine prints exactly one JSON object on stdout. Its stderr log goes to `${TMPDIR:-/tmp}/archshell-engine.log`, so the command output is only the reply. If the output is empty, stop and show the user the last 20 lines of that log.
 
 ## The loop
 
