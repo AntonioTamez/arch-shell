@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "ArchShell core: domain, engine, and CLI."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["jinja2==3.1.6", "pyyaml==6.0.3"]
+dependencies = ["jinja2==3.1.6", "jsonschema==4.26.0", "pyyaml==6.0.3"]
 
 [project.scripts]
 archshell-engine = "archshell.engine.cli:main"
@@ -16,3 +16,7 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-root = ""
+# `schemas/` holds the core JSON Schemas, read at runtime; it ships as data
+# beside the `archshell` package (a namespace root with no `__init__.py`).
+module-name = ["archshell", "schemas"]
+namespace = true

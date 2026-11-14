@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from archshell.adapters.output_schemas import validate
 from archshell.adapters.state_store import (
     CorruptState,
     LockHeld,
@@ -21,8 +22,10 @@ def first_state():
 
 
 def second_state(state):
-    sub = Submission("probe", state.action.action_id, state.revision, None, None, {})
-    outcome = on_submit(state, sub, FreshIds("id-2", "n-2"))
+    sub = Submission(
+        "probe", state.action.action_id, state.revision, None, None, {"text": "ok"}
+    )
+    outcome = on_submit(state, sub, FreshIds("id-2", "n-2"), validate=validate)
     assert isinstance(outcome, Outcome)
     return outcome.state
 

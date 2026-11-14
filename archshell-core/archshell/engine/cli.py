@@ -123,14 +123,31 @@ def cmd_submit(feature: str, message: Message, store: StateStore) -> Message:
             {"feature": feature, "message_feature": submission.feature},
         )
     require_flow(feature)
+    # Imported here so `next` and the hooks do not pay for loading jsonschema.
+    from archshell.adapters import output_schemas
+
     with store.locked(feature):
         state = store.read(feature)
-        outcome = workflow.on_submit(state, submission, fresh_ids())
+        outcome = workflow.on_submit(
+            state, submission, fresh_ids(), validate=output_schemas.validate
+        )
         if isinstance(outcome, workflow.Refusal):
+            if outcome.code == "invalid_output":
+                log(
+                    "submit_invalid_output", feature=feature,
+                    revision=state.revision if state else None,
+                    error_count=outcome.details.get("error_count"),
+                )
             raise refuse(outcome)
         assert state is not None  # on_submit refuses when there is no state
         store.ensure_prompt(outcome.state)
         store.write(outcome.state, expected_revision=state.revision)
+    if outcome.state.attempts:  # nonzero only while the same step is being retried
+        log(
+            "submit_retry", feature=feature, revision=outcome.state.revision,
+            attempt=outcome.state.attempts, error_count=len(outcome.state.errors),
+        )
+        return outcome.action.to_message()
     log("submit_accepted", feature=feature, revision=outcome.state.revision)
     return outcome.action.to_message()
 

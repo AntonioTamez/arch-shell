@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hmac
 import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,6 +26,10 @@ from archshell.domain.actions import (
 )
 
 STATE_SCHEMA = "archshell/state/v1"
+STATE_FIELDS = frozenset(
+    {"schema", "feature", "flow", "step", "revision", "action", "attempts", "errors"}
+)
+LEGACY_STATE_FIELDS = STATE_FIELDS - {"attempts", "errors"}
 SUBMIT_SCHEMA = "archshell/submit/v1"
 HUMAN_SOURCE = "human_ui"
 SUBMIT_FIELDS = frozenset(
@@ -38,6 +43,17 @@ SLUG_MAX_LENGTH = 64
 # is POSIX and relative to the project root; the engine writes the file.
 PROMPTS_DIR = ".archshell/state/prompts"
 ACTION_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}")
+
+# An invalid `llm_task` result re-issues the step at most this many times
+# before the submit is refused with `invalid_output`.
+DEFAULT_MAX_RETRIES = 2
+# Schema errors kept in state, retry prompts, and `invalid_output` details.
+MAX_REPORTED_ERRORS = 10
+MAX_ERROR_MESSAGE_LENGTH = 200
+
+# (schema id, result) -> schema errors as (path, message); empty when valid.
+# Supplied by an adapter, so the domain stays free of files and libraries.
+OutputValidator = Callable[[str, Any], Sequence[tuple[str, str]]]
 
 
 def is_valid_slug(value: Any) -> bool:
@@ -63,13 +79,21 @@ class Step:
     # `ask`/`confirm` only: engine-written question header and option labels.
     header: str = ""
     options: tuple[str, ...] = ()
+    # `llm_task` only: the core schema id its result must match.
+    output_schema: str = ""
 
+
+LLM_TEXT_SCHEMA = "archshell/llm-text/v1"
 
 # Built-in diagnostic flows; the feature slug selects the flow until real
 # feature workflows exist. `done` and `report` are terminal (AD-2).
 FLOWS: dict[str, tuple[Step, ...]] = {
     "probe": (
-        Step("llm_task", "Probe: reply with one short sentence confirming you received this task."),
+        Step(
+            "llm_task",
+            "Probe: reply with one short sentence confirming you received this task.",
+            output_schema=LLM_TEXT_SCHEMA,
+        ),
         Step(
             "ask",
             "Probe: is the ArchShell action protocol reaching you?",
@@ -86,7 +110,11 @@ FLOWS: dict[str, tuple[Step, ...]] = {
         Step("done", "Probe finished: every action type was exchanged."),
     ),
     "probe-report": (
-        Step("llm_task", "Probe: reply with one short sentence confirming you received this task."),
+        Step(
+            "llm_task",
+            "Probe: reply with one short sentence confirming you received this task.",
+            output_schema=LLM_TEXT_SCHEMA,
+        ),
         Step("report", "Probe report: the protocol stopped with a report action."),
     ),
 }
@@ -102,6 +130,19 @@ def prompt_file_for(action_id: str) -> str:
     if not is_valid_action_id(action_id):
         raise ValueError(f"action id is not usable as a file name: {action_id!r}")
     return f"{PROMPTS_DIR}/{action_id}.md"
+
+
+def retry_prompt(step: Step, errors: Sequence[tuple[str, str]]) -> str:
+    """The step's prompt, then the errors its previous answer had."""
+    lines = "".join(f"- {path}: {message}\n" for path, message in errors)
+    return f"{step.text}\n\nYour previous answer did not match {step.output_schema}:\n{lines}"
+
+
+def cap_errors(errors: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (path[:MAX_ERROR_MESSAGE_LENGTH], message[:MAX_ERROR_MESSAGE_LENGTH])
+        for path, message in errors[:MAX_REPORTED_ERRORS]
+    )
 
 
 def build_action(step: Step, feature: str, revision: int, ids: FreshIds) -> Action:
@@ -155,6 +196,10 @@ class CursorState:
     step: int
     revision: int
     action: Action
+    # Retries issued for the current step, and the errors that caused the
+    # latest one (its prompt states them). Both reset when the cursor advances.
+    attempts: int = 0
+    errors: tuple[tuple[str, str], ...] = ()
 
     @property
     def ended(self) -> bool:
@@ -164,7 +209,9 @@ class CursorState:
         """The prompt file the pending action points at, or None if it has none."""
         if not isinstance(self.action, LlmTask):
             return None
-        return PromptFile(self.action.prompt_file, FLOWS[self.flow][self.step].text)
+        step = FLOWS[self.flow][self.step]
+        text = retry_prompt(step, self.errors) if self.attempts else step.text
+        return PromptFile(self.action.prompt_file, text)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -174,6 +221,8 @@ class CursorState:
             "step": self.step,
             "revision": self.revision,
             "action": self.action.to_message(),
+            "attempts": self.attempts,
+            "errors": [{"path": p, "message": m} for p, m in self.errors],
         }
 
     @staticmethod
@@ -182,7 +231,10 @@ class CursorState:
             raise StateError("state must be an object")
         if data.get("schema") != STATE_SCHEMA:
             raise StateError(f"state schema must be {STATE_SCHEMA}")
-        if set(data) != {"schema", "feature", "flow", "step", "revision", "action"}:
+        if set(data) == LEGACY_STATE_FIELDS:
+            # Written before retries existed: no retry is in progress.
+            data = {**data, "attempts": 0, "errors": []}
+        if set(data) != STATE_FIELDS:
             raise StateError("state has missing or unknown fields")
         feature, flow, step, revision = (
             data["feature"], data["flow"], data["step"], data["revision"]
@@ -191,11 +243,15 @@ class CursorState:
             raise StateError("state feature is not a valid slug")
         if flow not in FLOWS:
             raise StateError(f"unknown flow: {flow!r}")
-        for name, value in (("step", step), ("revision", revision)):
+        attempts = data["attempts"]
+        for name, value in (("step", step), ("revision", revision), ("attempts", attempts)):
             if not isinstance(value, int) or isinstance(value, bool):
                 raise StateError(f"{name} must be an integer")
-        if not 0 <= step < len(FLOWS[flow]) or revision < 1:
-            raise StateError("step or revision out of range")
+        if not 0 <= step < len(FLOWS[flow]) or revision < 1 or attempts < 0:
+            raise StateError("step, revision, or attempts out of range")
+        errors = parse_state_errors(data["errors"])
+        if bool(attempts) != bool(errors) or (attempts and not FLOWS[flow][step].output_schema):
+            raise StateError("attempts and errors do not match the cursor")
         try:
             action = action_from_message(data["action"])
         except ActionError as exc:
@@ -211,7 +267,22 @@ class CursorState:
             or action.prompt_file != prompt_file_for(action.action_id)
         ):
             raise StateError("pending llm_task prompt_file does not match its action id")
-        return CursorState(feature, flow, step, revision, action)
+        return CursorState(feature, flow, step, revision, action, attempts, errors)
+
+
+def parse_state_errors(value: Any) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, list) or len(value) > MAX_REPORTED_ERRORS:
+        raise StateError(f"errors must be a list of at most {MAX_REPORTED_ERRORS} entries")
+    errors = []
+    for entry in value:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"path", "message"}
+            or not all(isinstance(entry[k], str) for k in ("path", "message"))
+        ):
+            raise StateError("each error must be {path, message} strings")
+        errors.append((entry["path"], entry["message"]))
+    return tuple(errors)
 
 
 @dataclass(frozen=True)
@@ -288,9 +359,20 @@ def on_next(state: CursorState | None, feature: str, ids: FreshIds) -> Outcome |
 
 
 def on_submit(
-    state: CursorState | None, submission: Submission, ids: FreshIds
+    state: CursorState | None,
+    submission: Submission,
+    ids: FreshIds,
+    *,
+    validate: OutputValidator,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> Outcome | Refusal:
-    """Accept a result for the pending action and advance, or refuse it."""
+    """Accept a result for the pending action and advance, or refuse it.
+
+    An `llm_task` result that does not match its step's output schema re-issues
+    the same step as a new `llm_task` (fresh id, next revision) whose prompt
+    states the errors, at most `max_retries` times; the next invalid result is
+    refused with `invalid_output` and the state stays as it is.
+    """
     if state is None or state.ended:
         return Refusal("no_pending_action", "there is no pending action to submit")
     pending = state.action
@@ -312,7 +394,29 @@ def on_submit(
                 f"{pending.type} result must come from the host's question UI",
                 {"expected_source": HUMAN_SOURCE},
             )
-    step = state.step + 1
+    current = FLOWS[state.flow][state.step]
     revision = state.revision + 1
+    if current.output_schema:
+        found = list(validate(current.output_schema, submission.result))
+        if found:
+            errors = cap_errors(found)
+            if state.attempts >= max_retries:
+                return Refusal(
+                    "invalid_output",
+                    f"llm_task result does not match {current.output_schema} "
+                    f"and the retry limit ({max_retries}) is used up",
+                    {
+                        "output_schema": current.output_schema,
+                        "error_count": len(found),
+                        "errors": [{"path": p, "message": m} for p, m in errors],
+                    },
+                )
+            action = build_action(current, state.feature, revision, ids)
+            retry = CursorState(
+                state.feature, state.flow, state.step, revision, action,
+                state.attempts + 1, errors,
+            )
+            return Outcome(retry, action, True)
+    step = state.step + 1
     action = build_action(FLOWS[state.flow][step], state.feature, revision, ids)
     return Outcome(CursorState(state.feature, state.flow, step, revision, action), action, True)

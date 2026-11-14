@@ -64,7 +64,7 @@ def submission_for(action: dict, **overrides) -> dict:
         "feature": action["feature"],
         "action_id": action["action_id"],
         "revision": action["revision"],
-        "result": {"answer": "yes"},
+        "result": {"text": "ok"} if action["type"] == "llm_task" else {"answer": "yes"},
     }
     if action["type"] in ("ask", "confirm"):
         message["nonce"] = action["nonce"]
@@ -394,6 +394,83 @@ def test_corrupt_state_is_invalid_state(project):
     assert not project.lock_path().exists()
 
 
+# --- llm_task output validation (story 1.5) ----------------------------------
+
+
+def invalid_submit(action: dict, result: dict | None = None) -> dict:
+    return submission_for(action, result={} if result is None else result)
+
+
+def test_invalid_output_reissues_the_step_with_errors_in_the_prompt(project):
+    first = assert_ok(*project.next())
+    retry = assert_ok(*project.submit(invalid_submit(first, {"text": ""})))
+    assert retry["type"] == "llm_task"
+    assert retry["revision"] == first["revision"] + 1
+    assert retry["action_id"] != first["action_id"]
+    assert retry["prompt_file"] != first["prompt_file"]
+    raw = project.prompt_path(retry).read_bytes()
+    assert raw.decode("utf-8") == (
+        FLOWS["probe"][0].text
+        + "\n\nYour previous answer did not match archshell/llm-text/v1:\n"
+        + "- $.text: '' should be non-empty\n"
+    )
+    state = json.loads(project.state_bytes())
+    assert (state["step"], state["attempts"], state["action"]) == (0, 1, retry)
+
+
+def test_repeat_next_during_retry_keeps_the_retry_prompt(project):
+    first = assert_ok(*project.next())
+    retry = assert_ok(*project.submit(invalid_submit(first)))
+    path = project.prompt_path(retry)
+    before, state = path.read_bytes(), project.state_bytes()
+    path.unlink()
+    assert assert_ok(*project.next()) == retry
+    assert path.read_bytes() == before
+    assert project.state_bytes() == state
+
+
+def test_retries_exhausted_is_invalid_output_and_state_unchanged(project):
+    action = assert_ok(*project.next())
+    for _ in range(2):
+        action = assert_ok(*project.submit(invalid_submit(action)))
+        assert action["type"] == "llm_task"
+    before = project.state_bytes()
+    code, msg = project.submit(invalid_submit(action, {"text": ""}))
+    assert_refused(code, msg, "invalid_output")
+    assert msg["details"] == {
+        "output_schema": "archshell/llm-text/v1",
+        "error_count": 1,
+        "errors": [{"path": "$.text", "message": "'' should be non-empty"}],
+    }
+    assert project.state_bytes() == before
+    assert assert_ok(*project.next()) == action
+
+
+def test_valid_output_after_retry_advances(project):
+    first = assert_ok(*project.next())
+    retry = assert_ok(*project.submit(invalid_submit(first)))
+    ask = assert_ok(*project.submit(submission_for(retry)))
+    assert ask["type"] == "ask" and ask["revision"] == 3
+    state = json.loads(project.state_bytes())
+    assert (state["step"], state["attempts"], state["errors"]) == (1, 0, [])
+
+
+def test_stale_submit_after_retry_is_refused_and_not_counted(project):
+    first = assert_ok(*project.next())
+    retry = assert_ok(*project.submit(invalid_submit(first)))
+    before = project.state_bytes()
+    assert_refused(*project.submit(invalid_submit(first)), "stale_action")
+    assert project.state_bytes() == before
+    second = assert_ok(*project.submit(invalid_submit(retry)))
+    assert second["type"] == "llm_task"
+
+
+def test_ask_result_content_is_not_schema_checked(project):
+    ask = advance_to(project, "ask")
+    confirm = assert_ok(*project.submit(submission_for(ask, result={"anything": 1})))
+    assert confirm["type"] == "confirm"
+
+
 # --- acceptance criteria -----------------------------------------------------
 
 
@@ -421,6 +498,19 @@ def test_probe_report_flow_ends_with_report(project):
     before = project.state_bytes("probe-report")
     assert_refused(*project.submit(submission_for(report), "probe-report"), "no_pending_action")
     assert project.state_bytes("probe-report") == before
+
+
+def test_three_invalid_llm_task_results_end_in_invalid_output(project):
+    action = assert_ok(*project.next())
+    replies = []
+    for _ in range(3):
+        code, msg = project.submit(invalid_submit(action))
+        replies.append(msg)
+        if msg["schema"] == "archshell/action/v1":
+            action = msg
+    assert [m.get("type") for m in replies[:2]] == ["llm_task", "llm_task"]
+    assert replies[2]["schema"] == "archshell/error/v1"
+    assert_refused(code, replies[2], "invalid_output")
 
 
 def test_state_file_is_sorted_key_json_with_lf(project):

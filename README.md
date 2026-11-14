@@ -60,6 +60,8 @@ A submit echoes `feature`, `action_id`, and `revision`, and carries `result` (an
 {"schema":"archshell/submit/v1","feature":"probe","action_id":"…","revision":2,"nonce":"…","source":"human_ui","result":{"answer":"yes"}}
 ```
 
+An `llm_task` result must match the core JSON Schema (draft 2020-12, `archshell-core/schemas/`) that its step names. Every `llm_task` today uses `archshell/llm-text/v1`: an object with exactly one property, `text`, a non-empty string, e.g. `{"text":"…"}`. The engine validates the result on `submit`, under the lock, after the `action_id`/`revision` checks. An invalid result re-issues the same step as a new `llm_task` (fresh `action_id`, `revision` +1, new `prompt_file`) whose prompt is the step's prompt followed by `Your previous answer did not match archshell/llm-text/v1:` and one `- <path>: <message>` line per schema error (path as a JSON path such as `$` or `$.text`). At most 2 retries are issued per step; the next invalid result is refused with `invalid_output` and the state stays as it was, with the last retry still pending. The retry count is kept in the state file (`attempts`, with the errors that caused the latest retry in `errors`) and resets when the cursor advances. A stale submit is refused before validation and does not count. `ask`, `confirm`, and `instruct_agent` results are not schema-checked. The host never retries on its own: a retry is simply the next `llm_task` it receives.
+
 Cursor state lives at `.archshell/state/<slug>.yaml` (sorted-key JSON, gitignored). Every write is a revision compare-and-swap under the lock file `.archshell/locks/<slug>.lock`. If an engine process is killed while holding the lock, delete the lock file by hand. A refused command never changes the state file.
 
 Until real feature workflows exist, two built-in flows exercise the action set: `probe` (`llm_task` → `ask` → `confirm` → `instruct_agent` → `done`) and `probe-report` (`llm_task` → `report`).
@@ -78,6 +80,7 @@ Error codes (`archshell/error/v1`, exit code 2):
 | `stale_action` | the submit's `action_id` or `revision` is not the pending one (includes replaying a consumed `ask`/`confirm`) |
 | `nonce_mismatch` | `ask`/`confirm` result with a missing or wrong `nonce` |
 | `invalid_source` | `ask`/`confirm` result without `source: "human_ui"` |
+| `invalid_output` | an `llm_task` result still does not match its output schema after the retries; `details` holds `output_schema`, `error_count`, and `errors` (at most 10 `{path, message}` entries, paths and messages cut at 200 characters each) |
 | `locked` | another invocation holds the feature's lock |
 | `invalid_state` | the state file is unreadable |
 | `internal_error` | unexpected engine failure |
