@@ -6,16 +6,22 @@ Built on PyYAML's `SafeLoader`. Refuses, with `YamlReadError`:
 - merge keys (`<<`) and duplicate mapping keys;
 - values outside the subset: anything but `str`, `int`, `bool`, `None`,
   lists, and mappings with `str` keys (so no floats, timestamps, or binary);
+- plain (unquoted) scalars the canonical emitter would quote, except
+  `true`, `false`, `null`, `~`, an empty value, and decimal integers, which
+  YAML 1.1 and 1.2 read the same way (so `1:30`, `010`, `0x1f`, `yes` are refused);
 - more than one document, and malformed YAML.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import yaml
 from yaml.events import AliasEvent, CollectionStartEvent, ScalarEvent
 from yaml.nodes import MappingNode
+
+from archshell.render.yaml_emit import needs_quotes
 
 
 class YamlReadError(ValueError):
@@ -23,6 +29,17 @@ class YamlReadError(ValueError):
 
 
 _MERGE_TAG = "tag:yaml.org,2002:merge"
+# Plain scalars YAML 1.1 and 1.2 read the same way as non-strings.
+_PLAIN_NON_STRINGS = frozenset({"", "~", "null", "true", "false"})
+_DECIMAL_INT = re.compile(r"-?(?:0|[1-9][0-9]*)")
+
+
+def _plain_is_unambiguous(value: str) -> bool:
+    return (
+        value in _PLAIN_NON_STRINGS
+        or _DECIMAL_INT.fullmatch(value) is not None
+        or not needs_quotes(value)
+    )
 
 
 class _Loader(yaml.SafeLoader):
@@ -60,9 +77,22 @@ def load(text: str) -> object:
                     raise YamlReadError(f"anchor &{event.anchor} is not allowed at {event.start_mark}")
                 if event.tag is not None:
                     raise YamlReadError(f"tag {event.tag} is not allowed at {event.start_mark}")
+            if (
+                isinstance(event, ScalarEvent)
+                and event.style is None
+                and not _plain_is_unambiguous(event.value)
+            ):
+                raise YamlReadError(
+                    f"plain scalar {event.value!r} must be quoted (YAML 1.1 and 1.2 may"
+                    f" read it differently) at {event.start_mark}"
+                )
         data = yaml.load(text, Loader=_Loader)  # noqa: S506 - _Loader is a SafeLoader
+    except YamlReadError:
+        raise
     except yaml.YAMLError as exc:
         raise YamlReadError(f"malformed YAML: {exc}") from None
+    except ValueError as exc:  # e.g. an invalid timestamp such as 2026-13-45
+        raise YamlReadError(f"invalid value: {exc}") from None
     except RecursionError:
         raise YamlReadError("document nested too deeply") from None
     _check_subset(data)

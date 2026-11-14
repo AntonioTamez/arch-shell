@@ -21,6 +21,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: LF in the working tree (.gitattributes, any core.autocrlf)
+        run: |
+          crlf="$(git ls-files --eol | grep 'w/crlf' || true)"
+          if [ -n "$crlf" ]; then
+            echo "tracked files checked out with CRLF:"
+            echo "$crlf"
+            exit 1
+          fi
+
       - uses: astral-sh/setup-uv@v6
 
       - uses: actions/setup-dotnet@v4

@@ -124,8 +124,16 @@ def _nfc(text: str) -> str:
     return unicodedata.normalize("NFC", text)
 
 
+def needs_quotes(text: str) -> bool:
+    """True when `text` must be double-quoted to read back as the same string.
+
+    The safe reader uses the same predicate to refuse ambiguous plain scalars.
+    """
+    return not (_PLAIN.fullmatch(text) and text.casefold() not in _RESERVED)
+
+
 def _string(text: str) -> str:
-    if _PLAIN.fullmatch(text) and text.casefold() not in _RESERVED:
+    if not needs_quotes(text):
         return text
     return '"' + "".join(_escape(char) for char in text) + '"'
 

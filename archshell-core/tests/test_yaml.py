@@ -115,6 +115,7 @@ def test_reader_refuses_anchors_aliases_and_tags(text):
     [
         "a: 1.5\n",
         "a: 2026-11-13\n",
+        "a: 2026-13-45\n",
         "a: 1\na: 2\n",
         "<<: {a: 1}\n",
         "? [a]\n: 1\n",
@@ -125,6 +126,31 @@ def test_reader_refuses_anchors_aliases_and_tags(text):
 def test_reader_refuses_values_outside_the_subset(text):
     with pytest.raises(YamlReadError):
         load(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["a: 1:30\n", "a: 010\n", "a: 0x1f\n", "a: 0o17\n", "a: 1_000\n", "a: +1\n",
+     "a: yes\n", "a: No\n", "a: on\n", "a: y\n", "a: True\n", "a: .inf\n", "yes: 1\n",
+     "a: [off]\n"],
+)
+def test_reader_refuses_ambiguous_plain_scalars(text):
+    with pytest.raises(YamlReadError, match="must be quoted"):
+        load(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("a: true\nb: false\n", {"a": True, "b": False}),
+        ("a: 0\nb: 42\nc: -7\n", {"a": 0, "b": 42, "c": -7}),
+        ("a: null\nb: ~\nc:\n", {"a": None, "b": None, "c": None}),
+        ('a: "1:30"\nb: "010"\nc: "yes"\nd: plain text\n',
+         {"a": "1:30", "b": "010", "c": "yes", "d": "plain text"}),
+    ],
+)
+def test_reader_accepts_unambiguous_plain_scalars(text, expected):
+    assert load(text) == expected
 
 
 def test_round_trip_emit_then_read():
