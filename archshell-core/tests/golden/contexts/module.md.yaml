@@ -1,0 +1,7 @@
+module:
+  name: Appointments
+  notes: "Renée owns scheduling."
+  blocks:
+    - {name: Reschedule, kind: operation, public: true}
+    - {name: Cancel, kind: operation, public: true}
+    - {name: Slot, kind: entity, public: false}

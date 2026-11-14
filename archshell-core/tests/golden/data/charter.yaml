@@ -1,0 +1,14 @@
+schema: archshell/charter/v1
+name: Clinic
+version: 3
+modules: [{name: Billing, public: false}, {name: Appointments, public: true}]
+quoting:
+  boolean_word: "yes"
+  number_word: "1"
+  colon: ": x"
+  empty: ""
+  leading_space: " padded"
+  date_like: "2026-11-13"
+  null_word: "null"
+  plain: plain words stay plain
+owner: ~

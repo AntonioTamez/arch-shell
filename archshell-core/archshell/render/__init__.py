@@ -1,1 +1,1 @@
-"""Pure render functions (AD-21): host renderers keyed by host id."""
+"""Pure render functions (AD-4, AD-5, AD-21): normalizer, templates, canonical YAML, host renderers."""
