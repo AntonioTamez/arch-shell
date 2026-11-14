@@ -30,6 +30,9 @@ jobs:
       - name: uv sync
         run: uv sync --locked
 
+      - name: golden byte check (rendered sha256 must match the committed manifest)
+        run: uv run pytest -v archshell-core/tests/test_golden.py
+
       - name: pytest
         run: uv run pytest
 
