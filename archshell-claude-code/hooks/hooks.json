@@ -1,0 +1,40 @@
+{
+  "description": "ArchShell hook forwards: archshell-engine computes every verdict; this file holds no paths or rules.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"${CLAUDE_PROJECT_DIR:-.}\" && ${ARCHSHELL_ENGINE:-archshell-engine} guard-write --host claude-code 2>>\"${TMPDIR:-/tmp}/archshell-engine.log\" || { echo 'ArchShell: guard-write could not run, so the write is blocked; see archshell-engine.log' >&2; exit 2; }",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"${CLAUDE_PROJECT_DIR:-.}\" && ${ARCHSHELL_ENGINE:-archshell-engine} check-edit --host claude-code 2>>\"${TMPDIR:-/tmp}/archshell-engine.log\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"${CLAUDE_PROJECT_DIR:-.}\" && ${ARCHSHELL_ENGINE:-archshell-engine} on-stop --host claude-code 2>>\"${TMPDIR:-/tmp}/archshell-engine.log\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
