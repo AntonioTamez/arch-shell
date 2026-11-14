@@ -147,3 +147,54 @@ def test_ping_uses_the_engine_override():
     fields, body = frontmatter(PING)
     assert f"{ENGINE_EXPANSION} next --feature probe" in body
     assert f"Bash({ENGINE_EXPANSION} next:*)" in fields["allowed-tools"]
+
+
+# --- hooks.json (story 1.4) -------------------------------------------------
+
+HOOKS = PLUGIN / "hooks" / "hooks.json"
+STDERR_LOG = '2>>"${TMPDIR:-/tmp}/archshell-engine.log"'
+CD_PROJECT = 'cd "${CLAUDE_PROJECT_DIR:-.}" && '
+HOOK_EVENTS = {
+    "PreToolUse": ("guard-write", "Write|Edit|MultiEdit|NotebookEdit"),
+    "PostToolUse": ("check-edit", "Write|Edit|MultiEdit|NotebookEdit"),
+    "Stop": ("on-stop", None),
+}
+
+
+def hook_commands() -> dict[str, list[dict]]:
+    text = HOOKS.read_bytes().decode("utf-8")
+    assert not text.startswith("\ufeff")
+    return json.loads(text)["hooks"]
+
+
+def test_hooks_json_wires_each_event_to_its_engine_command():
+    hooks = hook_commands()
+    assert set(hooks) == set(HOOK_EVENTS)
+    for event, (command, matcher) in HOOK_EVENTS.items():
+        (group,) = hooks[event]
+        assert group.get("matcher") == matcher, event
+        (hook,) = group["hooks"]
+        assert hook["type"] == "command"
+        assert hook["command"].startswith(f"{CD_PROJECT}{ENGINE_EXPANSION} {command} --host claude-code {STDERR_LOG}")
+
+
+def test_hook_commands_are_one_line_and_hold_no_paths():
+    for groups in hook_commands().values():
+        for group in groups:
+            for hook in group["hooks"]:
+                command = hook["command"]
+                assert "\n" not in command and "\r" not in command
+                assert command.count(ENGINE_EXPANSION) == 1
+                assert STDERR_LOG in command
+                without_log = command.replace(STDERR_LOG, "")
+                for forbidden in (".archshell", "src/", ":\\", "/tmp", "--feature"):
+                    assert forbidden not in without_log, (forbidden, command)
+
+
+def test_guard_write_hook_fails_closed_when_the_engine_cannot_run():
+    (group,) = hook_commands()["PreToolUse"]
+    command = group["hooks"][0]["command"]
+    assert command.endswith("exit 2; }")
+    # `cd && engine || fallback`: a failed cd or a failed engine both block.
+    assert command.startswith(CD_PROJECT)
+    assert command.count(" && ") == 1 and command.index(" && ") < command.index(" || { ")

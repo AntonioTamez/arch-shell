@@ -67,10 +67,11 @@ Error codes (`archshell/error/v1`, exit code 2):
 
 | Code | Meaning |
 | --- | --- |
-| `unknown_command` | no command, or not `next`/`submit` |
+| `unknown_command` | no command, or not `next`/`submit`/`guard-write`/`check-edit`/`on-stop` |
 | `invalid_feature` | `--feature` missing or not a valid slug, or the submit's `feature` differs from it |
-| `invalid_arguments` | arguments after `--feature <slug>` |
-| `invalid_message` | stdin is not a UTF-8 JSON object, or the submit message is malformed |
+| `invalid_arguments` | arguments after `--feature <slug>`; for a hook command, an option it does not take, a repeated option, or an option without a value |
+| `unknown_host` | a hook command's `--host` names no known host renderer |
+| `invalid_message` | stdin is not a UTF-8 JSON object, the submit message is malformed, or a hook message (or, with `--host`, the host's hook payload) is not a valid `archshell/hook/v1` message, e.g. a missing or empty `path` |
 | `unknown_feature` | no workflow exists for this slug |
 | `no_pending_action` | submit before the flow started or after `done`/`report` |
 | `stale_action` | the submit's `action_id` or `revision` is not the pending one (includes replaying a consumed `ask`/`confirm`) |
@@ -81,6 +82,43 @@ Error codes (`archshell/error/v1`, exit code 2):
 | `internal_error` | unexpected engine failure |
 
 On Windows machines where Application Control (Smart App Control) blocks unsigned executables, the uv launchers (`pytest.exe`, `archshell-engine.exe`) and the analyzer build output cannot start. Use the module forms instead: `uv run python -m pytest`, `echo '{}' | uv run python -m archshell.engine next --feature probe`.
+
+## Hook sub-protocol (`archshell/hook/v1` → `archshell/verdict/v1`)
+
+Three commands give per-write, per-edit, and stop-time verdicts. The engine computes every verdict and the protected set; host config holds no paths or rules.
+
+| Command | Options | stdin | Rule today |
+| --- | --- | --- | --- |
+| `guard-write` | `[--host <id>]` | `{"schema":"archshell/hook/v1","path":"<path>","cwd":"<dir>"}` (`cwd` optional) | `block` every path under `.archshell/` (AD-10), else `allow` |
+| `check-edit` | `[--host <id>]` | same as `guard-write` | always `allow` (per-edit checks come with epic 4) |
+| `on-stop` | `[--feature <slug>] [--host <id>]` | `{"schema":"archshell/hook/v1"}` | always `allow` (stop gates come later) |
+
+The verdict is one line on stdout, exit code 0:
+
+```json
+{"schema":"archshell/verdict/v1","verdict":"block","code":"protected_path","reason":"ArchShell: .archshell/x is engine-owned. …"}
+```
+
+`verdict` is `allow` or `block`; `code` is `allowed` for an allow; `reason` is the text shown to the agent. Paths are resolved against `cwd` (default: the project root, which is the working directory), `.` and `..` are collapsed, Win32 device prefixes are stripped, trailing dots and spaces in names are ignored, `\` counts as a separator, and the result is compared with the project root case-insensitively. A drive-relative path such as `C:x` cannot be resolved and is blocked (`unresolvable_path`). The check runs twice, once lexically and once with symlinks resolved (`realpath`) for both root and path; either block wins. A path outside the project root is allowed.
+
+**Fail-closed rule:** `guard-write` never fails open. Bad arguments, an unknown host, a non-JSON or malformed message, or any unexpected engine error yields a `block` verdict whose `code` is the error code (`invalid_arguments`, `unknown_host`, `invalid_message`, `internal_error`, …) with the `archshell/error/v1` message in `error`, exit code 2. `check-edit` and `on-stop` errors are plain `archshell/error/v1` messages, exit code 2.
+
+```sh
+echo '{"schema":"archshell/hook/v1","path":".archshell/x"}' | uv run python -m archshell.engine guard-write   # block, protected_path
+echo '{"schema":"archshell/hook/v1","path":"src/app.py"}' | uv run python -m archshell.engine guard-write   # allow
+```
+
+### Host renderers (`--host`)
+
+`--host <id>` reads the host's own hook payload instead of `archshell/hook/v1` and prints the host's hook output instead of the verdict, with exit code 0. Two cases exit 2 with a host-neutral `block` verdict (carrying `error`) instead of host output: an unknown `--host` (`unknown_host`, no renderer to use) and a renderer that fails (`internal_error`). Renderers are pure functions under `archshell/render/hosts/`, keyed by host id; today only `claude-code`:
+
+| Command | Claude Code event | Payload read | `block` renders as | `allow` renders as |
+| --- | --- | --- | --- | --- |
+| `guard-write` | PreToolUse | `tool_input.file_path` (Write, Edit, MultiEdit) or `tool_input.notebook_path` (NotebookEdit), `cwd` | `hookSpecificOutput.permissionDecision: "deny"` with the engine's reason | nothing (the normal permission flow continues) |
+| `check-edit` | PostToolUse | same | `{"decision":"block","reason":…}` (reason fed to the agent) | nothing |
+| `on-stop` | Stop | `cwd` | `{"decision":"block","reason":…}` (agent keeps working) | nothing |
+
+With `--host`, a `guard-write` error still renders a deny; `check-edit` and `on-stop` errors render nothing, so a broken hook never traps the agent.
 
 ## Install the Claude Code plugin from the local marketplace
 
@@ -135,3 +173,15 @@ Try both built-in flows:
 ```
 
 Cursor state persists under `.archshell/` in the working directory, so a finished flow keeps returning its terminal action; delete `.archshell/state/<feature>.yaml` to run it again.
+
+### Hooks: see a protected write refused
+
+The plugin ships `archshell-claude-code/hooks/hooks.json`, which Claude Code loads with the plugin. Each hook is a one-line forward that first changes to `${CLAUDE_PROJECT_DIR:-.}` (so the protected root is the project root even after the agent runs `cd`) and then calls the engine through the same `ARCHSHELL_ENGINE` override, with engine stderr appended to `${TMPDIR:-/tmp}/archshell-engine.log`:
+
+| Event | Matcher | Engine command |
+| --- | --- | --- |
+| PreToolUse | `Write\|Edit\|MultiEdit\|NotebookEdit` | `guard-write --host claude-code`; if the `cd` fails or the engine cannot run at all, the hook exits 2 and the write is blocked |
+| PostToolUse | `Write\|Edit\|MultiEdit\|NotebookEdit` | `check-edit --host claude-code` |
+| Stop | (all) | `on-stop --host claude-code` |
+
+After updating the plugin (`/plugin` → update, then restart Claude Code), ask the agent to create `.archshell/test.txt`. Claude Code refuses the write and shows the engine's reason (`ArchShell: .archshell/test.txt is engine-owned. …`). Ordinary edits proceed with no hook output. Writes made through shell commands are not intercepted; `archshell verify` in CI is the real guard.
