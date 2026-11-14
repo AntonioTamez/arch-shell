@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from archshell.domain.workflow import FLOWS
+
 ENGINE = [sys.executable, "-m", "archshell.engine"]
 
 
@@ -23,6 +25,9 @@ class Project:
 
     def state_path(self, feature: str = "probe") -> Path:
         return self.root / ".archshell" / "state" / f"{feature}.yaml"
+
+    def prompt_path(self, action: dict) -> Path:
+        return self.root.joinpath(*action["prompt_file"].split("/"))
 
     def lock_path(self, feature: str = "probe") -> Path:
         return self.root / ".archshell" / "locks" / f"{feature}.lock"
@@ -250,6 +255,88 @@ def test_bad_feature_is_refused(project, command, args):
 def test_extra_arguments_are_refused(project):
     assert_refused(*project.engine("next", "--feature", "probe", "--x"), "invalid_arguments")
     assert not (project.root / ".archshell").exists()
+
+
+# --- llm_task prompt files -------------------------------------------------
+
+
+def test_llm_task_carries_prompt_file_holding_the_prompt_exactly(project):
+    action = assert_ok(*project.next())
+    assert action["type"] == "llm_task"
+    assert set(action) == {"schema", "type", "feature", "action_id", "revision", "prompt_file"}
+    assert action["prompt_file"] == f".archshell/state/prompts/{action['action_id']}.md"
+    raw = project.prompt_path(action).read_bytes()
+    assert raw == FLOWS["probe"][0].text.encode("utf-8")
+    assert not raw.startswith(b"\xef\xbb\xbf") and b"\r" not in raw
+
+
+def test_repeat_next_keeps_the_same_prompt_file(project):
+    first = assert_ok(*project.next())
+    path = project.prompt_path(first)
+    before = path.read_bytes()
+    again = assert_ok(*project.next())
+    assert again["prompt_file"] == first["prompt_file"]
+    assert path.read_bytes() == before
+
+
+def test_repeat_next_restores_a_missing_prompt_file(project):
+    first = assert_ok(*project.next())
+    path = project.prompt_path(first)
+    path.unlink()
+    state = project.state_bytes()
+    assert assert_ok(*project.next()) == first
+    assert path.read_bytes() == FLOWS["probe"][0].text.encode("utf-8")
+    assert project.state_bytes() == state
+
+
+def test_prompt_file_stays_while_later_actions_are_pending(project):
+    first = assert_ok(*project.next())
+    ask = assert_ok(*project.submit(submission_for(first)))
+    assert ask["type"] == "ask"
+    assert project.prompt_path(first).exists()
+
+
+def test_probe_report_llm_task_has_its_own_prompt_file(project):
+    first = assert_ok(*project.next("probe-report"))
+    assert project.prompt_path(first).read_bytes() == FLOWS["probe-report"][0].text.encode("utf-8")
+
+
+def test_tampered_prompt_file_in_state_is_invalid_state(project):
+    assert_ok(*project.next())
+    state = json.loads(project.state_bytes())
+    state["action"]["prompt_file"] = "../outside.md"
+    tampered = (json.dumps(state, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    project.state_path().write_bytes(tampered)
+    assert_refused(*project.next(), "invalid_state")
+    assert not (project.root.parent / "outside.md").exists()
+    assert project.state_bytes() == tampered
+
+
+# --- question text -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("action_type", "options"), [("ask", ["Yes", "No"]), ("confirm", ["Confirm", "Decline"])]
+)
+def test_questions_carry_engine_header_and_options(project, action_type, options):
+    action = advance_to(project, action_type)
+    assert set(action) == {
+        "schema", "type", "feature", "action_id", "revision",
+        "question", "header", "options", "nonce",
+    }
+    assert action["header"] == "Probe"
+    assert action["options"] == options
+    assert assert_ok(*project.next()) == action
+
+
+def test_pending_question_without_options_in_state_is_invalid_state(project):
+    advance_to(project, "ask")
+    state = json.loads(project.state_bytes())
+    del state["action"]["options"]
+    tampered = (json.dumps(state, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    project.state_path().write_bytes(tampered)
+    assert_refused(*project.next(), "invalid_state")
+    assert project.state_bytes() == tampered
 
 
 # --- further refusals --------------------------------------------------------

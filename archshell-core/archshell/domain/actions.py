@@ -11,6 +11,11 @@ from typing import Any, ClassVar
 
 ACTION_SCHEMA = "archshell/action/v1"
 
+# Question text the host shows verbatim (AD-2): a short header and 2-4 labels.
+HEADER_MAX_LENGTH = 12
+OPTIONS_MIN = 2
+OPTIONS_MAX = 4
+
 Message = dict[str, Any]
 
 
@@ -31,14 +36,19 @@ class _Action:
     def to_message(self) -> Message:
         message: Message = {"schema": ACTION_SCHEMA, "type": self.type}
         for field in fields(self):
-            message[field.name] = getattr(self, field.name)
+            value = getattr(self, field.name)
+            message[field.name] = list(value) if isinstance(value, tuple) else value
         return message
 
 
 @dataclass(frozen=True)
 class LlmTask(_Action):
+    """A model task. The prompt is not carried inline: `prompt_file` is a POSIX
+    path, relative to the project root, of a file the engine wrote holding the
+    prompt, line endings normalized to LF, UTF-8 without BOM (AD-3)."""
+
     type: ClassVar[str] = "llm_task"
-    prompt: str
+    prompt_file: str
 
 
 @dataclass(frozen=True)
@@ -46,14 +56,20 @@ class Ask(_Action):
     type: ClassVar[str] = "ask"
     requires_human: ClassVar[bool] = True
     question: str
+    header: str
+    options: tuple[str, ...]
     nonce: str
 
 
 @dataclass(frozen=True)
 class Confirm(_Action):
+    """A yes/no confirmation. The first option confirms; any other declines."""
+
     type: ClassVar[str] = "confirm"
     requires_human: ClassVar[bool] = True
     question: str
+    header: str
+    options: tuple[str, ...]
     nonce: str
 
 
@@ -96,11 +112,28 @@ def action_from_message(message: Any) -> Action:
     names = [field.name for field in fields(cls)]
     if set(message) != {"schema", "type", *names}:
         raise ActionError(f"{cls.type} fields must be exactly {sorted(names)}")
+    values: dict[str, Any] = {}
     for name in names:
         value = message[name]
         if name == "revision":
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ActionError("revision must be a positive integer")
+        elif name == "options":
+            if (
+                not isinstance(value, (list, tuple))
+                or not OPTIONS_MIN <= len(value) <= OPTIONS_MAX
+                or not all(isinstance(label, str) and label.strip() for label in value)
+                or len(set(value)) != len(value)
+            ):
+                raise ActionError(
+                    f"options must be {OPTIONS_MIN}-{OPTIONS_MAX} unique non-blank strings"
+                )
+            value = tuple(value)
         elif not isinstance(value, str):
             raise ActionError(f"{name} must be a string")
-    return cls(**{name: message[name] for name in names})  # type: ignore[return-value]
+        elif name == "header" and (
+            not value.strip() or len(value) > HEADER_MAX_LENGTH
+        ):
+            raise ActionError(f"header must be non-blank, at most {HEADER_MAX_LENGTH} characters")
+        values[name] = value
+    return cls(**values)  # type: ignore[return-value]

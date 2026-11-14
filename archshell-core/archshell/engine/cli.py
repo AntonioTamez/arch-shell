@@ -98,6 +98,7 @@ def cmd_next(feature: str, message: Message, store: StateStore) -> Message:
         outcome = workflow.on_next(state, feature, fresh_ids())
         if isinstance(outcome, workflow.Refusal):
             raise refuse(outcome)
+        store.ensure_prompt(outcome.state)
         if outcome.changed:
             store.write(outcome.state, expected_revision=0 if state is None else state.revision)
     return outcome.action.to_message()
@@ -120,6 +121,7 @@ def cmd_submit(feature: str, message: Message, store: StateStore) -> Message:
         if isinstance(outcome, workflow.Refusal):
             raise refuse(outcome)
         assert state is not None  # on_submit refuses when there is no state
+        store.ensure_prompt(outcome.state)
         store.write(outcome.state, expected_revision=state.revision)
     log("submit_accepted", feature=feature, revision=outcome.state.revision)
     return outcome.action.to_message()
