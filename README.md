@@ -13,6 +13,7 @@ ArchShell: an architecture shell that keeps an AI coding agent inside a confirme
 | `.claude-plugin/marketplace.json` | local marketplace that lists the plugin |
 | `global.json` | pins the .NET SDK band (10.0.4xx, `rollForward: latestFeature`) |
 | `.github/workflows/ci.yml` | CI on Ubuntu, Windows, and macOS |
+| `.gitattributes` | forces LF for every text file |
 
 ## Local setup
 
@@ -119,6 +120,29 @@ echo '{"schema":"archshell/hook/v1","path":"src/app.py"}' | uv run python -m arc
 | `on-stop` | Stop | `cwd` | `{"decision":"block","reason":…}` (agent keeps working) | nothing |
 
 With `--host`, a `guard-write` error still renders a deny; `check-edit` and `on-stop` errors render nothing, so a broken hook never traps the agent.
+
+## Generation path
+
+Every file ArchShell generates goes through one path, so its bytes are identical on Windows, Linux, and macOS (AD-4, AD-5). Nothing writes a generated file any other way, and no formatter ever runs on the output.
+
+| Step | Module | Kind |
+| --- | --- | --- |
+| read template text | `archshell.adapters.files.read_text` | IO |
+| render | `archshell.render.templates.render(text, context)`: Jinja2 3.1.6, `StrictUndefined`, no autoescape, `keep_trailing_newline`, no loader (`include`/`import`/`extends` refused), nondeterministic `lipsum` and `random` removed | pure |
+| emit YAML | `archshell.render.yaml_emit.emit(data)` | pure |
+| normalize | `archshell.render.normalize.normalize(text)`: drop a leading BOM, CRLF and lone CR to LF, NFC, exactly one final `\n` | pure |
+| write | `archshell.adapters.files.write_text(path, text)`: normalizes, encodes UTF-8 without BOM, writes a unique temp file in the same directory, fsyncs it, and `os.replace`s it (removed on failure), skips identical bytes | IO |
+| read YAML | `archshell.adapters.yaml_read.read(path)` / `load(text)` | IO |
+
+`render` and `emit` already return normalized text; `write_text` normalizes again, so text from anywhere reaches disk in the same form.
+
+A template that uses a name the context does not define is refused with `RenderError` naming it (`names`), even inside a branch not taken; an undefined attribute at render time, a syntax error, and any exception raised while rendering are `RenderError` too.
+
+**YAML subset (AD-11).** The emitter writes only `str`, `int`, `bool`, `null`, lists, and mappings with `str` keys, in block style with two-space indentation (`{}` and `[]` for empty collections). Keys are sorted by codepoint unless the mapping is an `Ordered`, whose order the caller fixes. Strings are composed to NFC; a string is plain only if every YAML 1.1 and 1.2 reader reads it back unchanged (it starts with a letter or `_`, uses only letters, digits, `_./-` and single inner spaces, and is not a word such as `yes`, `no`, `on`, `off`, `y`, `n`, `true`, `false`, `null`); otherwise it is double-quoted with JSON-style escapes. Floats and every other type are refused with `EmitError`. The reader is PyYAML's `SafeLoader` plus checks: anchors, aliases, any explicit tag, merge keys, plain (unquoted) scalars the emitter would quote (only `true`, `false`, `null`, `~`, empty, and decimal integers are accepted unquoted, so `1:30`, `010`, `0x1f`, `yes` are refused), duplicate keys, more than one document, and values outside the subset (floats, timestamps) are refused with `YamlReadError`. Emit then read returns equal data.
+
+**Golden byte check.** `archshell-core/tests/golden/` holds templates, their contexts, YAML data, and `manifest.sha256`. `tests/test_golden.py` renders or re-emits each one through `write_text` and compares the sha256 of the written bytes with the manifest; CI runs it on all three OSes, so a match everywhere means byte identity across them. After an intended change, copy the actual manifest printed by the failing test into `manifest.sha256`.
+
+**Line endings.** `.gitattributes` sets `* text=auto eol=lf` (binary formats marked), so tracked text files are LF in the index and the working tree on every OS, including Windows with `core.autocrlf=true`.
 
 ## Install the Claude Code plugin from the local marketplace
 

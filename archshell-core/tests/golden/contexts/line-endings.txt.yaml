@@ -1,0 +1,4 @@
+bom: "﻿"
+windows: "crlf one\r\ncrlf two\r\n"
+classic_mac: "cr one\rcr two\r"
+tail: " end"

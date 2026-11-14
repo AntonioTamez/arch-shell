@@ -1,0 +1,13 @@
+# Module {{ module.name }}
+
+Café rule: every name is composed to NFC (this line is written decomposed).
+
+{% for block in module.blocks | sort(attribute="name") -%}
+- `{{ block.name }}` ({{ block.kind }}){% if block.public %} public{% endif %}
+{% endfor -%}
+{% if module.notes %}
+Notes: {{ module.notes }}
+{%- endif %}
+
+
+
