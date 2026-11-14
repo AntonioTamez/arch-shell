@@ -1,0 +1,16 @@
+# Every text file is LF in the index and in the working tree, on every OS (NFR-4).
+* text=auto eol=lf
+
+# Binary formats: never normalized, never diffed as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.dll binary
+*.exe binary
+*.nupkg binary
+*.snk binary
