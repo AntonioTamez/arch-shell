@@ -6,6 +6,7 @@ import dataclasses
 
 import pytest
 
+from archshell.adapters.output_schemas import validate
 from archshell.domain import workflow
 from archshell.domain.actions import (
     ACTION_TYPES,
@@ -35,7 +36,12 @@ def ids(n: int) -> FreshIds:
 def good(action) -> Submission:
     nonce = getattr(action, "nonce", None)
     source = "human_ui" if action.requires_human else None
-    return Submission(action.feature, action.action_id, action.revision, nonce, source, {})
+    result = {"text": "ok"} if action.type == "llm_task" else {}
+    return Submission(action.feature, action.action_id, action.revision, nonce, source, result)
+
+
+def submit(state, sub, fresh, **options):
+    return on_submit(state, sub, fresh, validate=validate, **options)
 
 
 def start(feature: str = "probe") -> Outcome:
@@ -49,7 +55,7 @@ def drive(feature: str) -> list[Outcome]:
     n = 2
     while not outcomes[-1].state.ended:
         current = outcomes[-1]
-        nxt = on_submit(current.state, good(current.action), ids(n))
+        nxt = submit(current.state, good(current.action), ids(n))
         assert isinstance(nxt, Outcome), nxt
         outcomes.append(nxt)
         n += 1
@@ -204,7 +210,7 @@ def test_pending_prompt_is_the_step_text():
     assert prompt == workflow.PromptFile(
         ".archshell/state/prompts/id-1.md", workflow.FLOWS["probe"][0].text
     )
-    asked = on_submit(first.state, good(first.action), ids(2))
+    asked = submit(first.state, good(first.action), ids(2))
     assert isinstance(asked, Outcome) and asked.state.pending_prompt() is None
 
 
@@ -217,7 +223,7 @@ def test_prompt_file_for_rejects_unsafe_action_ids(action_id):
 def test_probe_report_flow_ends_with_report():
     outcomes = drive("probe-report")
     assert [o.action.type for o in outcomes] == ["llm_task", "report"]
-    refusal = on_submit(outcomes[-1].state, good(outcomes[-1].action), ids(9))
+    refusal = submit(outcomes[-1].state, good(outcomes[-1].action), ids(9))
     assert refusal == Refusal("no_pending_action", refusal.message, {})
 
 
@@ -238,7 +244,7 @@ def test_next_unknown_feature():
 
 def test_submit_without_state():
     sub = Submission("probe", "id-1", 1, None, None, {})
-    refusal = on_submit(None, sub, ids(2))
+    refusal = submit(None, sub, ids(2))
     assert isinstance(refusal, Refusal) and refusal.code == "no_pending_action"
 
 
@@ -248,13 +254,13 @@ def test_submit_without_state():
 def test_submit_stale(change):
     first = start()
     sub = dataclasses.replace(good(first.action), **change)
-    refusal = on_submit(first.state, sub, ids(2))
+    refusal = submit(first.state, sub, ids(2))
     assert isinstance(refusal, Refusal) and refusal.code == "stale_action"
 
 
 def ask_state() -> Outcome:
     first = start()
-    outcome = on_submit(first.state, good(first.action), ids(2))
+    outcome = submit(first.state, good(first.action), ids(2))
     assert isinstance(outcome, Outcome) and outcome.action.type == "ask"
     return outcome
 
@@ -263,7 +269,7 @@ def ask_state() -> Outcome:
 def test_submit_nonce_mismatch(nonce):
     asked = ask_state()
     sub = dataclasses.replace(good(asked.action), nonce=nonce)
-    refusal = on_submit(asked.state, sub, ids(3))
+    refusal = submit(asked.state, sub, ids(3))
     assert isinstance(refusal, Refusal) and refusal.code == "nonce_mismatch"
 
 
@@ -271,23 +277,23 @@ def test_submit_nonce_mismatch(nonce):
 def test_submit_invalid_source(source):
     asked = ask_state()
     sub = dataclasses.replace(good(asked.action), source=source)
-    refusal = on_submit(asked.state, sub, ids(3))
+    refusal = submit(asked.state, sub, ids(3))
     assert isinstance(refusal, Refusal) and refusal.code == "invalid_source"
 
 
 def test_submit_nonce_replay_is_stale():
     asked = ask_state()
     consumed = good(asked.action)
-    confirmed = on_submit(asked.state, consumed, ids(3))
+    confirmed = submit(asked.state, consumed, ids(3))
     assert isinstance(confirmed, Outcome)
-    refusal = on_submit(confirmed.state, consumed, ids(4))
+    refusal = submit(confirmed.state, consumed, ids(4))
     assert isinstance(refusal, Refusal) and refusal.code == "stale_action"
 
 
 def test_non_human_actions_ignore_nonce_and_source():
     first = start()
     sub = dataclasses.replace(good(first.action), nonce="whatever", source="agent")
-    assert isinstance(on_submit(first.state, sub, ids(2)), Outcome)
+    assert isinstance(submit(first.state, sub, ids(2)), Outcome)
 
 
 def test_state_round_trip():
@@ -341,3 +347,181 @@ def test_valid_slugs(value):
 )
 def test_invalid_slugs(value):
     assert not workflow.is_valid_slug(value)
+
+
+# --- llm_task output validation and bounded retries ---------------------------
+
+
+def llm_sub(outcome: Outcome, result: dict) -> Submission:
+    return dataclasses.replace(good(outcome.action), result=result)
+
+
+def retry(outcome: Outcome, result: dict, n: int, **options) -> Outcome:
+    nxt = submit(outcome.state, llm_sub(outcome, result), ids(n), **options)
+    assert isinstance(nxt, Outcome), nxt
+    return nxt
+
+
+def test_probe_llm_steps_name_the_text_schema():
+    for flow in ("probe", "probe-report"):
+        assert workflow.FLOWS[flow][0].output_schema == "archshell/llm-text/v1"
+    assert all(
+        step.output_schema == ""
+        for flow in workflow.FLOWS.values()
+        for step in flow
+        if step.type != "llm_task"
+    )
+
+
+def test_valid_output_advances_and_keeps_attempts_at_zero():
+    nxt = retry(start(), {"text": "ok"}, 2)
+    assert (nxt.state.step, nxt.action.type, nxt.state.attempts, nxt.state.errors) == (
+        1, "ask", 0, ()
+    )
+
+
+@pytest.mark.parametrize(
+    "result, expected",
+    [
+        ({"text": ""}, [("$.text", "'' should be non-empty")]),
+        ({}, [("$", "'text' is a required property")]),
+    ],
+)
+def test_first_invalid_output_reissues_the_same_step(result, expected):
+    nxt = retry(start(), result, 2)
+    assert nxt.changed
+    assert isinstance(nxt.action, LlmTask)
+    assert (nxt.state.step, nxt.state.revision, nxt.state.attempts) == (0, 2, 1)
+    assert (nxt.action.action_id, nxt.action.revision) == ("id-2", 2)
+    assert list(nxt.state.errors) == expected
+    prompt = nxt.state.pending_prompt()
+    assert prompt.path == ".archshell/state/prompts/id-2.md"
+    step_text = workflow.FLOWS["probe"][0].text
+    lines = "".join(f"- {p}: {m}\n" for p, m in expected)
+    assert prompt.text == (
+        f"{step_text}\n\nYour previous answer did not match archshell/llm-text/v1:\n{lines}"
+    )
+
+
+def test_second_invalid_output_issues_the_second_retry():
+    third = retry(retry(start(), {}, 2), {"text": ""}, 3)
+    assert isinstance(third.action, LlmTask)
+    assert (third.state.step, third.state.revision, third.state.attempts) == (0, 3, 2)
+    assert third.state.errors == (("$.text", "'' should be non-empty"),)
+
+
+def test_third_invalid_output_is_refused_with_errors():
+    third = retry(retry(start(), {}, 2), {"text": ""}, 3)
+    refusal = submit(third.state, llm_sub(third, {"text": "", "x": 1}), ids(4))
+    assert isinstance(refusal, Refusal)
+    assert refusal.code == "invalid_output"
+    assert refusal.details == {
+        "output_schema": "archshell/llm-text/v1",
+        "error_count": 2,
+        "errors": [
+            {"path": "$", "message": "Additional properties are not allowed ('x' was unexpected)"},
+            {"path": "$.text", "message": "'' should be non-empty"},
+        ],
+    }
+
+
+@pytest.mark.parametrize("retries", [1, 2])
+def test_valid_output_after_retries_advances_and_resets_attempts(retries):
+    outcome = start()
+    for n in range(retries):
+        outcome = retry(outcome, {}, n + 2)
+    nxt = retry(outcome, {"text": "fixed"}, 9)
+    assert nxt.action.type == "ask"
+    assert (nxt.state.step, nxt.state.attempts, nxt.state.errors) == (1, 0, ())
+    assert nxt.state.revision == retries + 2
+
+
+def test_stale_submit_after_retry_is_not_counted():
+    first = start()
+    second = retry(first, {}, 2)
+    refusal = submit(second.state, llm_sub(first, {}), ids(3))
+    assert isinstance(refusal, Refusal) and refusal.code == "stale_action"
+    # The refusal leaves the state as it was: still one retry issued.
+    third = retry(second, {}, 4)
+    assert third.state.attempts == 2
+
+
+def test_zero_max_retries_refuses_at_once():
+    first = start()
+    refusal = submit(first.state, llm_sub(first, {}), ids(2), max_retries=0)
+    assert isinstance(refusal, Refusal) and refusal.code == "invalid_output"
+    assert refusal.message == (
+        "llm_task result does not match archshell/llm-text/v1 "
+        "and the retry limit (0) is used up"
+    )
+
+
+def test_errors_are_capped():
+    many = [(f"$.f{i:02}" + "p" * 500, "m" * 500) for i in range(25)]
+    first = start()
+    nxt = on_submit(first.state, llm_sub(first, {}), ids(2), validate=lambda s, r: many)
+    assert isinstance(nxt, Outcome)
+    assert len(nxt.state.errors) == workflow.MAX_REPORTED_ERRORS
+    assert all(
+        len(p) == len(m) == workflow.MAX_ERROR_MESSAGE_LENGTH for p, m in nxt.state.errors
+    )
+    assert CursorState.from_dict(nxt.state.to_dict()) == nxt.state
+
+
+def test_validator_runs_only_for_llm_task_steps():
+    calls = []
+
+    def spy(schema_id, result):
+        calls.append(schema_id)
+        return validate(schema_id, result)
+
+    outcome = start()
+    n = 2
+    while not outcome.state.ended:
+        outcome = on_submit(outcome.state, good(outcome.action), ids(n), validate=spy)
+        n += 1
+    assert calls == ["archshell/llm-text/v1"]
+
+
+def test_state_round_trip_with_attempts():
+    second = retry(start(), {}, 2)
+    data = second.state.to_dict()
+    assert data["attempts"] == 1
+    assert data["errors"] == [{"path": "$", "message": "'text' is a required property"}]
+    assert CursorState.from_dict(data) == second.state
+
+
+def test_state_without_attempts_reads_as_no_retry():
+    data = start().state.to_dict()
+    del data["attempts"], data["errors"]
+    state = CursorState.from_dict(data)
+    assert (state.attempts, state.errors) == (0, ())
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda d: d.update(attempts=-1),
+        lambda d: d.update(attempts=True),
+        lambda d: d.update(attempts="1"),
+        lambda d: d.update(attempts=0),
+        lambda d: d.update(errors=[]),
+        lambda d: d.update(errors="x"),
+        lambda d: d.update(errors=[{"path": "$"}]),
+        lambda d: d.update(errors=[{"path": "$", "message": 1}]),
+        lambda d: d.update(errors=[{"path": "$", "message": "m"}] * 11),
+        lambda d: d.pop("errors"),
+    ],
+)
+def test_retry_state_from_dict_rejects_invalid(mutate):
+    data = retry(start(), {}, 2).state.to_dict()
+    mutate(data)
+    with pytest.raises(StateError):
+        CursorState.from_dict(data)
+
+
+def test_attempts_on_a_step_without_schema_is_invalid_state():
+    data = ask_state().state.to_dict()
+    data.update(attempts=1, errors=[{"path": "$", "message": "m"}])
+    with pytest.raises(StateError):
+        CursorState.from_dict(data)
