@@ -112,6 +112,66 @@ def test_concurrent_writers_get_distinct_seqs(tmp_path):
     assert all(p.startswith("records/") for p in files(root))  # no claims or temp files left
 
 
+def test_delete_pending_claim_is_retried_for_the_same_seq(tmp_path, delete_pending):
+    # Windows: the claim of seq 1 was just released and is still "delete pending".
+    root = tmp_path / "project"
+    attempts = delete_pending("0001.claim", 2)
+    record = append_record(root, feature=FEATURE, flow="plan", confirmed_by="ana", content={"n": 1})
+    assert record.path == f".archshell/records/{FEATURE}/0001-plan.yaml"
+    assert record.document["seq"] == 1
+    assert len(attempts) == 3
+    assert [r.path for r in read_records(root, FEATURE)] == [record.path]
+
+
+def test_persistent_claim_permission_error_is_raised_not_skipped(tmp_path, delete_pending):
+    # A real permission problem must not look like a held claim (which would skip a seq).
+    root = tmp_path / "project"
+    attempts = delete_pending("0001.claim", 10**6)
+    with pytest.raises(PermissionError):
+        append_record(root, feature=FEATURE, flow="plan", confirmed_by="ana", content={"n": 1})
+    assert len(attempts) == 26  # 25 bounded retries, then the error
+    assert read_records(root, FEATURE) == []
+
+
+STRESS_RACER = """
+import sys, time
+from pathlib import Path
+from archshell.adapters.records import append_record
+root, go, k = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+while not go.exists():
+    time.sleep(0.001)
+for i in range(k):
+    print(append_record(root, feature="cancel-appointment", flow="plan", confirmed_by="ana",
+                        content={"n": i}).path, flush=True)
+"""
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows delete-pending race")
+def test_many_concurrent_appends_survive_windows_delete_pending(tmp_path):
+    # 12 writers x 15 appends reproduced PermissionError on claims before the fix.
+    go = tmp_path / "go"
+    root = tmp_path / "project"
+    writers, appends = 12, 15
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", STRESS_RACER, str(root), str(go), str(appends)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for _ in range(writers)
+    ]
+    time.sleep(1.0)
+    go.touch()
+    paths = []
+    for proc in procs:
+        out, err = proc.communicate(timeout=120)
+        assert proc.returncode == 0, err.decode()
+        paths.extend(out.decode().split())
+    assert len(set(paths)) == writers * appends
+    seqs = [r.document["seq"] for r in read_records(root, FEATURE)]
+    assert seqs == list(range(1, writers * appends + 1))
+
+
 @pytest.mark.parametrize(
     ("overrides", "path"),
     [

@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import stat
 import tempfile
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -31,6 +32,30 @@ def _write_synced(fd: int, data: bytes) -> None:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
+
+
+# Windows keeps an unlinked file "delete pending" until its last open handle
+# closes; until then an exclusive create of that name raises PermissionError,
+# not FileExistsError. The window is brief, so the create is retried with a
+# capped backoff (about one second in total) before the error is believed.
+_WINDOWS = os.name == "nt"
+_DELETE_PENDING_DELAYS = tuple(min(0.001 * 2**attempt, 0.05) for attempt in range(25))
+
+
+def open_exclusive(path: Path, flags: int = os.O_WRONLY, mode: int = 0o644) -> int:
+    """`os.open(path, O_CREAT | O_EXCL | flags, mode)`; return the descriptor.
+
+    Raises FileExistsError when `path` exists. On Windows a PermissionError
+    (the name is still "delete pending") is retried briefly, then re-raised.
+    """
+    for delay in (*_DELETE_PENDING_DELAYS, None):
+        try:
+            return os.open(path, os.O_CREAT | os.O_EXCL | flags, mode)
+        except PermissionError:
+            if not _WINDOWS or delay is None:
+                raise
+            time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def read_text(path: Path) -> str:

@@ -15,7 +15,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from archshell.adapters.files import path_of
+from archshell.adapters.files import open_exclusive, path_of
 from archshell.domain import layout
 from archshell.domain.workflow import CursorState, PromptFile, StateError
 
@@ -84,7 +84,7 @@ class StateStore:
         path = self.lock_path(feature)
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            fd = open_exclusive(path, mode=0o777)  # os.open's default, as before
         except FileExistsError:
             raise LockHeld(str(path)) from None
         try:
