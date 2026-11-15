@@ -14,28 +14,20 @@ import time
 from pathlib import Path
 
 import pytest
+from conftest import Project as BaseProject
+from conftest import engine_process, single_json_line, tree
 
 from archshell.domain import hooks
 from archshell.render.hosts import claude_code
 
-ENGINE = [sys.executable, "-m", "archshell.engine"]
 HOOK = "archshell/hook/v1"
 VERDICT = "archshell/verdict/v1"
 
 
-def tree(root: Path) -> list[str]:
-    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*"))
-
-
-class Project:
-    def __init__(self, root: Path):
-        self.root = root
-
+class Project(BaseProject):
     def run(self, *argv: str, stdin: bytes) -> tuple[int, str, bytes]:
         before = tree(self.root)
-        proc = subprocess.run(
-            ENGINE + list(argv), input=stdin, capture_output=True, cwd=self.root, timeout=60
-        )
+        proc = engine_process(self.root, *argv, stdin=stdin)
         assert tree(self.root) == before, "a hook command wrote a file"
         assert b"Traceback" not in proc.stdout
         return proc.returncode, proc.stdout.decode("utf-8"), proc.stderr
@@ -43,8 +35,7 @@ class Project:
     def hook(self, command: str, message: dict | bytes, *argv: str) -> tuple[int, dict]:
         stdin = message if isinstance(message, bytes) else json.dumps(message).encode("utf-8")
         code, out, err = self.run(command, *argv, stdin=stdin)
-        assert out.endswith("\n") and len(out.splitlines()) == 1, (out, err)
-        return code, json.loads(out)
+        return code, single_json_line(out, err)
 
     def host(self, command: str, payload: dict) -> tuple[int, str]:
         code, out, _ = self.run(

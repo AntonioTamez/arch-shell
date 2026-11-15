@@ -233,7 +233,7 @@ echo '{"schema":"archshell/hook/v1","path":"src/app.py"}' | uv run python -m arc
 
 ### Host renderers (`--host`)
 
-`--host <id>` reads the host's own hook payload instead of `archshell/hook/v1` and prints the host's hook output instead of the verdict, with exit code 0. Two cases exit 2 with a host-neutral `block` verdict (carrying `error`) instead of host output: an unknown `--host` (`unknown_host`, no renderer to use) and a renderer that fails (`internal_error`). Renderers are pure functions under `archshell/render/hosts/`, keyed by host id; today only `claude-code`:
+`--host <id>` reads the host's own hook payload instead of `archshell/hook/v1` and prints the host's hook output instead of the verdict, with exit code 0. For `guard-write`, two cases exit 2 with a host-neutral `block` verdict (carrying `error`) instead of host output: an unknown `--host` (`unknown_host`, no renderer to use) and a renderer that fails (`internal_error`). For `check-edit` and `on-stop`, an unknown `--host` exits 2 with a plain `archshell/error/v1` message, and a failing renderer prints nothing and exits 0. Renderers are pure functions under `archshell/render/hosts/`, keyed by host id; today only `claude-code`:
 
 | Command | Claude Code event | Payload read | `block` renders as | `allow` renders as |
 | --- | --- | --- | --- | --- |

@@ -13,10 +13,10 @@ import sys
 from importlib.metadata import entry_points
 
 import pytest
+from conftest import ENGINE, single_json_line
 
 from archshell import __version__
 
-ENGINE = [sys.executable, "-m", "archshell.engine"]
 CLI = [sys.executable, "-m", "archshell.cli"]
 
 
@@ -28,14 +28,6 @@ def _project_root(tmp_path, monkeypatch):
 
 def run(cmd: list[str], stdin: bytes = b"") -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(cmd, input=stdin, capture_output=True, timeout=60)
-
-
-def single_json_line(stdout: bytes) -> dict:
-    text = stdout.decode("utf-8")
-    assert text.endswith("\n"), text
-    lines = text.splitlines()
-    assert len(lines) == 1, text
-    return json.loads(lines[0])
 
 
 def test_console_scripts_point_at_main():

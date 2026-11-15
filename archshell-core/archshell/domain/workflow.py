@@ -44,14 +44,9 @@ SUBMIT_FIELDS = frozenset(
 SLUG_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 SLUG_MAX_LENGTH = 64
 
-# `llm_task` prompts live beside cursor state (`PROMPTS_DIR`), one file per
-# action id. The path is POSIX and relative to the project root; the engine
-# writes the file.
+# An action id names its `llm_task` prompt file (`prompt_file_for`).
 ACTION_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}")
 
-# An invalid `llm_task` result re-issues the step at most `max_retries` times
-# (default `DEFAULT_MAX_RETRIES`, config `max_retries`) before the submit is
-# refused with `invalid_output`.
 # Schema errors kept in state, retry prompts, and `invalid_output` details.
 MAX_REPORTED_ERRORS = 10
 MAX_ERROR_MESSAGE_LENGTH = 200
@@ -94,15 +89,17 @@ class Step:
 
 LLM_TEXT_SCHEMA = "archshell/llm-text/v1"
 
+_PROBE_TASK = Step(
+    "llm_task",
+    "Probe: reply with one short sentence confirming you received this task.",
+    output_schema=LLM_TEXT_SCHEMA,
+)
+
 # Built-in diagnostic flows; the feature slug selects the flow until real
 # feature workflows exist. `done` and `report` are terminal (AD-2).
 FLOWS: dict[str, tuple[Step, ...]] = {
     "probe": (
-        Step(
-            "llm_task",
-            "Probe: reply with one short sentence confirming you received this task.",
-            output_schema=LLM_TEXT_SCHEMA,
-        ),
+        _PROBE_TASK,
         Step(
             "ask",
             "flow.probe.ask.question",
@@ -119,11 +116,7 @@ FLOWS: dict[str, tuple[Step, ...]] = {
         Step("done", "flow.probe.done"),
     ),
     "probe-report": (
-        Step(
-            "llm_task",
-            "Probe: reply with one short sentence confirming you received this task.",
-            output_schema=LLM_TEXT_SCHEMA,
-        ),
+        _PROBE_TASK,
         Step("report", "flow.probe_report.report"),
     ),
 }
@@ -152,6 +145,11 @@ def cap_errors(errors: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]
         (path[:MAX_ERROR_MESSAGE_LENGTH], message[:MAX_ERROR_MESSAGE_LENGTH])
         for path, message in errors[:MAX_REPORTED_ERRORS]
     )
+
+
+def error_entries(errors: Sequence[tuple[str, str]]) -> list[dict[str, str]]:
+    """Errors as the `{path, message}` objects of state files and refusal details."""
+    return [{"path": path, "message": message} for path, message in errors]
 
 
 def step_texts(step: Step, lang: str, render: Renderer) -> dict[str, Any]:
@@ -256,7 +254,7 @@ class CursorState:
             "revision": self.revision,
             "action": self.action.to_message(),
             "attempts": self.attempts,
-            "errors": [{"path": p, "message": m} for p, m in self.errors],
+            "errors": error_entries(self.errors),
             "lang": self.lang,
         }
 
@@ -348,6 +346,15 @@ class Refusal:
 NO_PENDING_ACTION = Refusal("no_pending_action", msg("error.no_pending_action"))
 
 
+def unknown_feature(feature: str) -> Refusal:
+    """The refusal for a feature slug that selects no flow."""
+    return Refusal(
+        "unknown_feature",
+        msg("error.unknown_feature", feature=feature),
+        {"features": sorted(FLOWS)},
+    )
+
+
 @dataclass(frozen=True)
 class Outcome:
     """The action to return (in the request's language), the state to hold
@@ -423,12 +430,41 @@ def on_next(
     if state is not None:
         return Outcome(state, state.issued(render), changed=False)
     if feature not in FLOWS:
-        return Refusal(
-            "unknown_feature",
-            msg("error.unknown_feature", feature=feature),
-            {"features": sorted(FLOWS)},
-        )
+        return unknown_feature(feature)
     return issue(feature, feature, 0, 1, ids, lang, render)
+
+
+def _check_human(pending: Action, submission: Submission) -> Refusal | None:
+    """Refuse a submit for a human-only action without its nonce or human source."""
+    if not pending.requires_human:
+        return None
+    expected: str = pending.nonce  # type: ignore[union-attr]
+    if submission.nonce is None or not hmac.compare_digest(
+        submission.nonce.encode("utf-8"), expected.encode("utf-8")
+    ):
+        return Refusal("nonce_mismatch", msg("error.nonce_mismatch", type=pending.type))
+    if submission.source != HUMAN_SOURCE:
+        return Refusal(
+            "invalid_source",
+            msg("error.invalid_source", type=pending.type),
+            {"expected_source": HUMAN_SOURCE},
+        )
+    return None
+
+
+def _invalid_output(
+    output_schema: str, error_count: int, errors: Sequence[tuple[str, str]], max_retries: int
+) -> Refusal:
+    """The refusal once an `llm_task` step has used up its retries."""
+    return Refusal(
+        "invalid_output",
+        msg("error.invalid_output", output_schema=output_schema, max_retries=max_retries),
+        {
+            "output_schema": output_schema,
+            "error_count": error_count,
+            "errors": error_entries(errors),
+        },
+    )
 
 
 def on_submit(
@@ -457,18 +493,9 @@ def on_submit(
             msg("error.stale_action"),
             {"action_id": pending.action_id, "revision": state.revision},
         )
-    if pending.requires_human:
-        expected: str = pending.nonce  # type: ignore[union-attr]
-        if submission.nonce is None or not hmac.compare_digest(
-            submission.nonce.encode("utf-8"), expected.encode("utf-8")
-        ):
-            return Refusal("nonce_mismatch", msg("error.nonce_mismatch", type=pending.type))
-        if submission.source != HUMAN_SOURCE:
-            return Refusal(
-                "invalid_source",
-                msg("error.invalid_source", type=pending.type),
-                {"expected_source": HUMAN_SOURCE},
-            )
+    refusal = _check_human(pending, submission)
+    if refusal is not None:
+        return refusal
     current = FLOWS[state.flow][state.step]
     revision = state.revision + 1
     if current.output_schema:
@@ -476,19 +503,7 @@ def on_submit(
         if found:
             errors = cap_errors(found)
             if state.attempts >= max_retries:
-                return Refusal(
-                    "invalid_output",
-                    msg(
-                        "error.invalid_output",
-                        output_schema=current.output_schema,
-                        max_retries=max_retries,
-                    ),
-                    {
-                        "output_schema": current.output_schema,
-                        "error_count": len(found),
-                        "errors": [{"path": p, "message": m} for p, m in errors],
-                    },
-                )
+                return _invalid_output(current.output_schema, len(found), errors, max_retries)
             return issue(
                 state.flow, state.feature, state.step, revision, ids, lang, render,
                 state.attempts + 1, errors,

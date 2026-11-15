@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import stat
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 
 from archshell.render.normalize import to_bytes
@@ -17,6 +18,19 @@ from archshell.render.normalize import to_bytes
 def path_of(root: Path, relative: str) -> Path:
     """The path of a project-relative POSIX path under `root`."""
     return root.joinpath(*relative.split("/"))
+
+
+def format_errors(errors: Sequence[tuple[str, str]]) -> str:
+    """(path, message) errors as one `path: message; …` line, for exception text."""
+    return "; ".join(f"{path}: {message}" for path, message in errors)
+
+
+def _write_synced(fd: int, data: bytes) -> None:
+    """Write `data` to the open file descriptor `fd`, fsync it, and close it."""
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def read_text(path: Path) -> str:
@@ -41,10 +55,7 @@ def write_text(path: Path, text: str) -> bytes:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+        _write_synced(fd, data)
         # mkstemp creates 0600; give the file the target's mode, or 0644 when new.
         os.chmod(tmp, _mode_of(path))
         os.replace(tmp, path)
