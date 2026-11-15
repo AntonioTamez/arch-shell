@@ -280,4 +280,7 @@ def test_layout_names_every_engine_path():
     assert layout.state_file("probe") == ".archshell/state/probe.yaml"
     assert layout.lock_file("probe") == ".archshell/locks/probe.lock"
     assert layout.PROMPTS_DIR == ".archshell/state/prompts"
+    assert layout.RECORDS_DIR == ".archshell/records"
+    assert layout.records_dir("probe") == ".archshell/records/probe"
+    assert layout.record_claims_dir("probe") == ".archshell/locks/records/probe"
     assert all(d.startswith(f"{layout.ROOT}/") for d in layout.DIRECTORIES)

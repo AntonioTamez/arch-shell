@@ -91,6 +91,35 @@ max_retries: 2
 
 No other keys are allowed. A missing `config.yaml` means the defaults. `submit` reads it on every call; an invalid one is refused with `invalid_config`.
 
+### Confirmation records (`archshell/record/v1`)
+
+Every human confirmation leaves one structured record (FR-53), committed with the change it approves, at `.archshell/records/<feature-slug>/<seq>-<flow>.yaml`. `seq` is zero-padded to four digits and counted per feature from `0001`, shared by all flows (`0001-plan.yaml`, `0002-contract.yaml`). `flow` is one of `plan`, `extension`, `contract`, `contract-revision`, `breaking-change`, `growth`, `vocabulary`. The slug follows the `--feature` rule; `bootstrap` is a valid slug.
+
+```yaml
+schema: archshell/record/v1
+feature: cancel-appointment
+seq: 1
+flow: plan
+fingerprint: "sha256:…"
+confirmed_by: ana
+confirmed_at: "2026-11-14T09:30:00Z"
+derived: false
+content:
+  decision: cancel within 24 hours
+```
+
+| Field | Required | Value |
+| --- | --- | --- |
+| `schema` | yes | `archshell/record/v1` |
+| `feature`, `seq`, `flow` | yes | must match the record's path |
+| `fingerprint` | yes | `sha256:<64 hex>` of the canonical YAML bytes of the confirmed content |
+| `confirmed_by` | yes | non-empty, self-reported (AD-18) |
+| `confirmed_at` | yes | UTC, `YYYY-MM-DDTHH:MM:SSZ` |
+| `derived` | yes | `true` when the content is derived with no new decisions (FR-59) |
+| `content` | no | the confirmed content |
+
+No other keys are allowed. Records are **append-only**: `archshell.adapters.records.append_record(root, …)` validates the record against `archshell-core/schemas/record-v1.json`, then creates the next file exclusively and never replaces or edits an existing one. Concurrent writers claim a `seq` by exclusive create of `.archshell/locks/records/<feature>/<seq>.claim` (gitignored, removed after the write), so each gets a distinct `seq`; the record is written to a temporary file, fsynced, and hard-linked into place, so it is either fully present or absent. A writer killed mid-write may leave a gap in the sequence. `read_records(root, feature)` returns a feature's records in `seq` order, each validated, and raises `InvalidRecord` naming the file when one fails the schema, is not a `<seq>-<flow>.yaml` name, or names a different feature, seq, or flow than its path. No command writes records yet; agents still cannot write under `.archshell/`.
+
 Until real feature workflows exist, two built-in flows exercise the action set: `probe` (`llm_task` → `ask` → `confirm` → `instruct_agent` → `done`) and `probe-report` (`llm_task` → `report`).
 
 Error codes (`archshell/error/v1`, exit code 2):
