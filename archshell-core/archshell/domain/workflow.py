@@ -24,6 +24,7 @@ from archshell.domain.actions import (
     Report,
     action_from_message,
 )
+from archshell.domain.layout import DEFAULT_MAX_RETRIES, PROMPTS_DIR
 
 STATE_SCHEMA = "archshell/state/v1"
 STATE_FIELDS = frozenset(
@@ -39,14 +40,14 @@ SUBMIT_FIELDS = frozenset(
 SLUG_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 SLUG_MAX_LENGTH = 64
 
-# `llm_task` prompts live beside cursor state, one file per action id. The path
-# is POSIX and relative to the project root; the engine writes the file.
-PROMPTS_DIR = ".archshell/state/prompts"
+# `llm_task` prompts live beside cursor state (`PROMPTS_DIR`), one file per
+# action id. The path is POSIX and relative to the project root; the engine
+# writes the file.
 ACTION_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}")
 
-# An invalid `llm_task` result re-issues the step at most this many times
-# before the submit is refused with `invalid_output`.
-DEFAULT_MAX_RETRIES = 2
+# An invalid `llm_task` result re-issues the step at most `max_retries` times
+# (default `DEFAULT_MAX_RETRIES`, config `max_retries`) before the submit is
+# refused with `invalid_output`.
 # Schema errors kept in state, retry prompts, and `invalid_output` details.
 MAX_REPORTED_ERRORS = 10
 MAX_ERROR_MESSAGE_LENGTH = 200
@@ -302,6 +303,9 @@ class Refusal:
     details: dict[str, Any] = field(default_factory=dict)
 
 
+NO_PENDING_ACTION = Refusal("no_pending_action", "there is no pending action to submit")
+
+
 @dataclass(frozen=True)
 class Outcome:
     """The action to return, the state to hold, and whether it must be written."""
@@ -374,7 +378,7 @@ def on_submit(
     refused with `invalid_output` and the state stays as it is.
     """
     if state is None or state.ended:
-        return Refusal("no_pending_action", "there is no pending action to submit")
+        return NO_PENDING_ACTION
     pending = state.action
     if submission.action_id != pending.action_id or submission.revision != state.revision:
         return Refusal(

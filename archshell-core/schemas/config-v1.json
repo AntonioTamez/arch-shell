@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "archshell/config/v1",
+  "title": "ArchShell project config",
+  "description": "The project's .archshell/config.yaml.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "archshell/config/v1"
+    },
+    "max_retries": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10
+    }
+  },
+  "required": ["schema"],
+  "additionalProperties": false
+}

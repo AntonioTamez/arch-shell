@@ -16,13 +16,15 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from archshell.domain import layout
+
 HOOK_SCHEMA = "archshell/hook/v1"
 VERDICT_SCHEMA = "archshell/verdict/v1"
 
 ALLOW = "allow"
 BLOCK = "block"
 
-PROTECTED_DIR = ".archshell"
+PROTECTED_DIR = layout.ROOT
 
 _DRIVE = re.compile(r"[A-Za-z]:")
 _DEVICE_PREFIXES = ("//?/UNC/", "//./UNC/", "//?/", "//./")

@@ -15,6 +15,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from archshell.adapters.files import path_of
+from archshell.domain import layout
 from archshell.domain.workflow import CursorState, PromptFile, StateError
 
 
@@ -40,10 +42,10 @@ class StateStore:
         self.root = root
 
     def state_path(self, feature: str) -> Path:
-        return self.root / ".archshell" / "state" / f"{feature}.yaml"
+        return path_of(self.root, layout.state_file(feature))
 
     def prompt_path(self, prompt: PromptFile) -> Path:
-        return self.root.joinpath(*prompt.path.split("/"))
+        return path_of(self.root, prompt.path)
 
     def ensure_prompt(self, state: CursorState) -> None:
         """Hold the pending action's prompt file on disk (LF-normalized, UTF-8, no BOM).
@@ -67,7 +69,7 @@ class StateStore:
         os.replace(tmp, path)
 
     def lock_path(self, feature: str) -> Path:
-        return self.root / ".archshell" / "locks" / f"{feature}.lock"
+        return path_of(self.root, layout.lock_file(feature))
 
     @contextmanager
     def locked(self, feature: str) -> Iterator[None]:
