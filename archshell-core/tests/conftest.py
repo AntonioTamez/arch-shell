@@ -16,6 +16,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 ENGINE = [sys.executable, "-m", "archshell.engine"]
 
 
@@ -326,3 +328,43 @@ class ScriptedHost:
         for path in self.root.rglob("*"):
             if path.is_file():
                 self.written[path.relative_to(self.root).as_posix()] = path.read_bytes()
+
+
+# --- Windows delete-pending simulation ----------------------------------------
+
+
+@pytest.fixture
+def delete_pending(monkeypatch):
+    """Simulate Windows "delete pending" for exclusive creates.
+
+    Returns `pend(name, times)`: the next `times` `O_CREAT | O_EXCL` opens of a
+    file named `name` raise `PermissionError`, as Windows does while an unlinked
+    file still has an open handle. The adapters run their Windows path, without
+    real sleeps. `pend` returns the list of attempts made on `name`.
+    """
+    from archshell.adapters import files
+
+    monkeypatch.setattr(files, "_WINDOWS", True, raising=False)
+    delays = getattr(files, "_DELETE_PENDING_DELAYS", ())
+    monkeypatch.setattr(files, "_DELETE_PENDING_DELAYS", (0.0,) * len(delays), raising=False)
+    real_open = os.open
+    pending: dict[str, int] = {}
+    attempts: dict[str, list[int]] = {}
+
+    def fake_open(path, flags, *args, **kwargs):
+        name = os.path.basename(os.fspath(path))
+        if flags & os.O_EXCL and name in pending:
+            attempts[name].append(flags)
+            if pending[name] > 0:
+                pending[name] -= 1
+                raise PermissionError(13, "Permission denied", os.fspath(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fake_open)
+
+    def pend(name: str, times: int) -> list[int]:
+        pending[name] = times
+        attempts[name] = []
+        return attempts[name]
+
+    return pend

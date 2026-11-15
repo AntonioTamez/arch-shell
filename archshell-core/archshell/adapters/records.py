@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from archshell.adapters import yaml_read
-from archshell.adapters.files import _write_synced, format_errors, path_of
+from archshell.adapters.files import _write_synced, format_errors, open_exclusive, path_of
 from archshell.domain import layout, records
 from archshell.domain.workflow import is_valid_slug
 from archshell.render.normalize import to_bytes
@@ -212,7 +212,7 @@ def _claim(claims: Path, claim: Path) -> bool:
     """Exclusively create `claim`; False when another writer holds it."""
     claims.mkdir(parents=True, exist_ok=True)
     try:
-        fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        fd = open_exclusive(claim)
     except FileExistsError:
         return False
     os.close(fd)

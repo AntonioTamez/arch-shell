@@ -92,3 +92,34 @@ def test_state_for_another_feature_is_corrupt(tmp_path):
     path.write_bytes(serialize(first_state()))
     with pytest.raises(CorruptState):
         store.read("probe-report")
+
+
+def test_lock_retries_a_delete_pending_lock_file(tmp_path, delete_pending):
+    # Windows: the previous holder's unlinked lock file is still "delete pending".
+    store = StateStore(tmp_path)
+    attempts = delete_pending("probe.lock", 3)
+    with store.locked("probe"):
+        assert store.lock_path("probe").exists()
+    assert len(attempts) == 4
+    assert not store.lock_path("probe").exists()
+
+
+def test_lock_persistent_permission_error_is_not_lock_held(tmp_path, delete_pending):
+    store = StateStore(tmp_path)
+    attempts = delete_pending("probe.lock", 10**6)
+    with pytest.raises(PermissionError):
+        with store.locked("probe"):
+            pass
+    assert len(attempts) == 26  # 25 bounded retries, then the error
+
+
+def test_lock_permission_error_is_not_retried_off_windows(tmp_path, delete_pending, monkeypatch):
+    from archshell.adapters import files
+
+    monkeypatch.setattr(files, "_WINDOWS", False)
+    store = StateStore(tmp_path)
+    attempts = delete_pending("probe.lock", 1)
+    with pytest.raises(PermissionError):
+        with store.locked("probe"):
+            pass
+    assert len(attempts) == 1
