@@ -10,7 +10,7 @@ from __future__ import annotations
 import hmac
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from archshell.domain.actions import (
@@ -25,12 +25,16 @@ from archshell.domain.actions import (
     action_from_message,
 )
 from archshell.domain.layout import DEFAULT_MAX_RETRIES, PROMPTS_DIR
+from archshell.domain.messages import DEFAULT_LANG, LANGUAGES, Message, Renderer, msg
 
 STATE_SCHEMA = "archshell/state/v1"
 STATE_FIELDS = frozenset(
-    {"schema", "feature", "flow", "step", "revision", "action", "attempts", "errors"}
+    {"schema", "feature", "flow", "step", "revision", "action", "attempts", "errors", "lang"}
 )
-LEGACY_STATE_FIELDS = STATE_FIELDS - {"attempts", "errors"}
+# Older state shapes, read with defaults: before message catalogs (no `lang`),
+# and before retries (no `attempts`/`errors`, and no `lang` either).
+PRE_CATALOG_STATE_FIELDS = STATE_FIELDS - {"lang"}
+PRE_RETRY_STATE_FIELDS = STATE_FIELDS - {"attempts", "errors", "lang"}
 SUBMIT_SCHEMA = "archshell/submit/v1"
 HUMAN_SOURCE = "human_ui"
 SUBMIT_FIELDS = frozenset(
@@ -75,6 +79,10 @@ class FreshIds:
 
 @dataclass(frozen=True)
 class Step:
+    """One flow step. `text` is the prompt itself for an `llm_task` (written to
+    the prompt file, never localized) and a catalog message key for every other
+    type; `header` and `options` (`ask`/`confirm` only) are catalog keys too."""
+
     type: str
     text: str
     # `ask`/`confirm` only: engine-written question header and option labels.
@@ -97,18 +105,18 @@ FLOWS: dict[str, tuple[Step, ...]] = {
         ),
         Step(
             "ask",
-            "Probe: is the ArchShell action protocol reaching you?",
-            header="Probe",
-            options=("Yes", "No"),
+            "flow.probe.ask.question",
+            header="flow.probe.ask.header",
+            options=("flow.probe.ask.yes", "flow.probe.ask.no"),
         ),
         Step(
             "confirm",
-            "Probe: confirm to continue the protocol probe.",
-            header="Probe",
-            options=("Confirm", "Decline"),
+            "flow.probe.confirm.question",
+            header="flow.probe.confirm.header",
+            options=("flow.probe.confirm.confirm", "flow.probe.confirm.decline"),
         ),
-        Step("instruct_agent", "Probe: no change is needed; acknowledge this instruction."),
-        Step("done", "Probe finished: every action type was exchanged."),
+        Step("instruct_agent", "flow.probe.instruct"),
+        Step("done", "flow.probe.done"),
     ),
     "probe-report": (
         Step(
@@ -116,7 +124,7 @@ FLOWS: dict[str, tuple[Step, ...]] = {
             "Probe: reply with one short sentence confirming you received this task.",
             output_schema=LLM_TEXT_SCHEMA,
         ),
-        Step("report", "Probe report: the protocol stopped with a report action."),
+        Step("report", "flow.probe_report.report"),
     ),
 }
 
@@ -146,33 +154,46 @@ def cap_errors(errors: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]
     )
 
 
-def build_action(step: Step, feature: str, revision: int, ids: FreshIds) -> Action:
+def step_texts(step: Step, lang: str, render: Renderer) -> dict[str, Any]:
+    """The step's developer-facing action fields, rendered in `lang`."""
+
+    def text(key: str) -> str:
+        return render(Message(key), lang)
+
+    match step.type:
+        case "llm_task":
+            return {}
+        case "ask" | "confirm":
+            return {
+                "question": text(step.text),
+                "header": text(step.header),
+                "options": tuple(text(key) for key in step.options),
+            }
+        case "instruct_agent":
+            return {"instruction": text(step.text)}
+        case "report" | "done":
+            return {"summary": text(step.text)}
+    raise ValueError(f"unknown step type: {step.type}")
+
+
+def build_action(
+    step: Step, feature: str, revision: int, ids: FreshIds, lang: str, render: Renderer
+) -> Action:
     common = {"feature": feature, "action_id": ids.action_id, "revision": revision}
+    texts = step_texts(step, lang, render)
     match step.type:
         case "llm_task":
             return LlmTask(**common, prompt_file=prompt_file_for(ids.action_id))
         case "ask":
-            return Ask(
-                **common,
-                question=step.text,
-                header=step.header,
-                options=step.options,
-                nonce=ids.nonce,
-            )
+            return Ask(**common, **texts, nonce=ids.nonce)
         case "confirm":
-            return Confirm(
-                **common,
-                question=step.text,
-                header=step.header,
-                options=step.options,
-                nonce=ids.nonce,
-            )
+            return Confirm(**common, **texts, nonce=ids.nonce)
         case "instruct_agent":
-            return InstructAgent(**common, instruction=step.text)
+            return InstructAgent(**common, **texts)
         case "report":
-            return Report(**common, summary=step.text)
+            return Report(**common, **texts)
         case "done":
-            return Done(**common, summary=step.text)
+            return Done(**common, **texts)
     raise ValueError(f"unknown step type: {step.type}")
 
 
@@ -190,7 +211,12 @@ class PromptFile:
 
 @dataclass(frozen=True)
 class CursorState:
-    """Gitignored, reconstructible cursor: which step is current, at which revision."""
+    """Gitignored, reconstructible cursor: which step is current, at which revision.
+
+    `action` is the pending action rendered in English (the state file is never
+    localized); `lang` is the conversation language it was issued in, so a
+    repeated `next` returns it exactly as first issued (`issued`).
+    """
 
     feature: str
     flow: str
@@ -201,10 +227,17 @@ class CursorState:
     # latest one (its prompt states them). Both reset when the cursor advances.
     attempts: int = 0
     errors: tuple[tuple[str, str], ...] = ()
+    lang: str = DEFAULT_LANG
 
     @property
     def ended(self) -> bool:
         return self.action.terminal
+
+    def issued(self, render: Renderer) -> Action:
+        """The pending action as the host received it: in the language it was issued in."""
+        if self.lang == DEFAULT_LANG:
+            return self.action
+        return replace(self.action, **step_texts(FLOWS[self.flow][self.step], self.lang, render))
 
     def pending_prompt(self) -> PromptFile | None:
         """The prompt file the pending action points at, or None if it has none."""
@@ -224,6 +257,7 @@ class CursorState:
             "action": self.action.to_message(),
             "attempts": self.attempts,
             "errors": [{"path": p, "message": m} for p, m in self.errors],
+            "lang": self.lang,
         }
 
     @staticmethod
@@ -232,11 +266,17 @@ class CursorState:
             raise StateError("state must be an object")
         if data.get("schema") != STATE_SCHEMA:
             raise StateError(f"state schema must be {STATE_SCHEMA}")
-        if set(data) == LEGACY_STATE_FIELDS:
-            # Written before retries existed: no retry is in progress.
-            data = {**data, "attempts": 0, "errors": []}
+        if set(data) == PRE_RETRY_STATE_FIELDS:
+            # Written before retries existed: no retry is in progress, issued in English.
+            data = {**data, "attempts": 0, "errors": [], "lang": DEFAULT_LANG}
+        elif set(data) == PRE_CATALOG_STATE_FIELDS:
+            # Written before message catalogs existed: issued in English.
+            data = {**data, "lang": DEFAULT_LANG}
         if set(data) != STATE_FIELDS:
             raise StateError("state has missing or unknown fields")
+        lang = data["lang"]
+        if lang not in LANGUAGES:
+            raise StateError(f"lang must be one of {', '.join(LANGUAGES)}")
         feature, flow, step, revision = (
             data["feature"], data["flow"], data["step"], data["revision"]
         )
@@ -268,7 +308,7 @@ class CursorState:
             or action.prompt_file != prompt_file_for(action.action_id)
         ):
             raise StateError("pending llm_task prompt_file does not match its action id")
-        return CursorState(feature, flow, step, revision, action, attempts, errors)
+        return CursorState(feature, flow, step, revision, action, attempts, errors, lang)
 
 
 def parse_state_errors(value: Any) -> tuple[tuple[str, str], ...]:
@@ -298,17 +338,20 @@ class Submission:
 
 @dataclass(frozen=True)
 class Refusal:
+    """A typed refusal. `message` is a catalog message the adapter renders."""
+
     code: str
-    message: str
+    message: Message
     details: dict[str, Any] = field(default_factory=dict)
 
 
-NO_PENDING_ACTION = Refusal("no_pending_action", "there is no pending action to submit")
+NO_PENDING_ACTION = Refusal("no_pending_action", msg("error.no_pending_action"))
 
 
 @dataclass(frozen=True)
 class Outcome:
-    """The action to return, the state to hold, and whether it must be written."""
+    """The action to return (in the request's language), the state to hold
+    (in English), and whether it must be written."""
 
     state: CursorState
     action: Action
@@ -316,15 +359,15 @@ class Outcome:
 
 
 def parse_submission(message: dict[str, Any]) -> Submission | Refusal:
-    def invalid(text: str) -> Refusal:
-        return Refusal("invalid_message", text)
+    def invalid(key: str, **args: Any) -> Refusal:
+        return Refusal("invalid_message", msg(key, **args))
 
     if message.get("schema") != SUBMIT_SCHEMA:
-        return invalid(f"submit message schema must be {SUBMIT_SCHEMA}")
+        return invalid("error.submit_schema", schema=SUBMIT_SCHEMA)
     unknown = sorted(set(message) - SUBMIT_FIELDS)
     if unknown:
         return Refusal(
-            "invalid_message", "submit message has unknown fields", {"fields": unknown}
+            "invalid_message", msg("error.submit_unknown_fields"), {"fields": unknown}
         )
     feature = message.get("feature")
     action_id = message.get("action_id")
@@ -333,33 +376,59 @@ def parse_submission(message: dict[str, Any]) -> Submission | Refusal:
     source = message.get("source")
     result = message.get("result")
     if not isinstance(feature, str):
-        return invalid("feature must be a string")
+        return invalid("error.field_not_string", field="feature")
     if not isinstance(action_id, str):
-        return invalid("action_id must be a string")
+        return invalid("error.field_not_string", field="action_id")
     if not isinstance(revision, int) or isinstance(revision, bool):
-        return invalid("revision must be an integer")
+        return invalid("error.field_not_integer", field="revision")
     if nonce is not None and not isinstance(nonce, str):
-        return invalid("nonce must be a string")
+        return invalid("error.field_not_string", field="nonce")
     if source is not None and not isinstance(source, str):
-        return invalid("source must be a string")
+        return invalid("error.field_not_string", field="source")
     if not isinstance(result, dict):
-        return invalid("result must be an object")
+        return invalid("error.field_not_object", field="result")
     return Submission(feature, action_id, revision, nonce, source, result)
 
 
-def on_next(state: CursorState | None, feature: str, ids: FreshIds) -> Outcome | Refusal:
-    """Return the pending action, starting the feature's flow when there is no state."""
+def issue(
+    flow: str,
+    feature: str,
+    step: int,
+    revision: int,
+    ids: FreshIds,
+    lang: str,
+    render: Renderer,
+    attempts: int = 0,
+    errors: tuple[tuple[str, str], ...] = (),
+) -> Outcome:
+    """Issue `step` of `flow`: the state holds it in English, the host gets it in `lang`."""
+    stored = build_action(FLOWS[flow][step], feature, revision, ids, DEFAULT_LANG, render)
+    state = CursorState(feature, flow, step, revision, stored, attempts, errors, lang)
+    return Outcome(state, state.issued(render), changed=True)
+
+
+def on_next(
+    state: CursorState | None,
+    feature: str,
+    ids: FreshIds,
+    *,
+    render: Renderer,
+    lang: str = DEFAULT_LANG,
+) -> Outcome | Refusal:
+    """Return the pending action, starting the feature's flow when there is no state.
+
+    A pending action comes back exactly as it was issued, whatever `lang` this
+    call carries: a new language takes effect from the next action on.
+    """
     if state is not None:
-        return Outcome(state, state.action, changed=False)
-    flow = FLOWS.get(feature)
-    if flow is None:
+        return Outcome(state, state.issued(render), changed=False)
+    if feature not in FLOWS:
         return Refusal(
             "unknown_feature",
-            f"no workflow for feature: {feature}",
+            msg("error.unknown_feature", feature=feature),
             {"features": sorted(FLOWS)},
         )
-    action = build_action(flow[0], feature, 1, ids)
-    return Outcome(CursorState(feature, feature, 0, 1, action), action, changed=True)
+    return issue(feature, feature, 0, 1, ids, lang, render)
 
 
 def on_submit(
@@ -368,6 +437,8 @@ def on_submit(
     ids: FreshIds,
     *,
     validate: OutputValidator,
+    render: Renderer,
+    lang: str = DEFAULT_LANG,
     max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> Outcome | Refusal:
     """Accept a result for the pending action and advance, or refuse it.
@@ -383,7 +454,7 @@ def on_submit(
     if submission.action_id != pending.action_id or submission.revision != state.revision:
         return Refusal(
             "stale_action",
-            "submission does not match the pending action",
+            msg("error.stale_action"),
             {"action_id": pending.action_id, "revision": state.revision},
         )
     if pending.requires_human:
@@ -391,11 +462,11 @@ def on_submit(
         if submission.nonce is None or not hmac.compare_digest(
             submission.nonce.encode("utf-8"), expected.encode("utf-8")
         ):
-            return Refusal("nonce_mismatch", f"{pending.type} result carries a wrong nonce")
+            return Refusal("nonce_mismatch", msg("error.nonce_mismatch", type=pending.type))
         if submission.source != HUMAN_SOURCE:
             return Refusal(
                 "invalid_source",
-                f"{pending.type} result must come from the host's question UI",
+                msg("error.invalid_source", type=pending.type),
                 {"expected_source": HUMAN_SOURCE},
             )
     current = FLOWS[state.flow][state.step]
@@ -407,20 +478,19 @@ def on_submit(
             if state.attempts >= max_retries:
                 return Refusal(
                     "invalid_output",
-                    f"llm_task result does not match {current.output_schema} "
-                    f"and the retry limit ({max_retries}) is used up",
+                    msg(
+                        "error.invalid_output",
+                        output_schema=current.output_schema,
+                        max_retries=max_retries,
+                    ),
                     {
                         "output_schema": current.output_schema,
                         "error_count": len(found),
                         "errors": [{"path": p, "message": m} for p, m in errors],
                     },
                 )
-            action = build_action(current, state.feature, revision, ids)
-            retry = CursorState(
-                state.feature, state.flow, state.step, revision, action,
+            return issue(
+                state.flow, state.feature, state.step, revision, ids, lang, render,
                 state.attempts + 1, errors,
             )
-            return Outcome(retry, action, True)
-    step = state.step + 1
-    action = build_action(FLOWS[state.flow][step], state.feature, revision, ids)
-    return Outcome(CursorState(state.feature, state.flow, step, revision, action), action, True)
+    return issue(state.flow, state.feature, state.step + 1, revision, ids, lang, render)

@@ -198,3 +198,11 @@ def test_guard_write_hook_fails_closed_when_the_engine_cannot_run():
     # `cd && engine || fallback`: a failed cd or a failed engine both block.
     assert command.startswith(CD_PROJECT)
     assert command.count(" && ") == 1 and command.index(" && ") < command.index(" || { ")
+
+
+def test_run_passes_the_conversation_language_on_every_call():
+    _, body = frontmatter(RUN)
+    assert f"{ENGINE_EXPANSION} next --feature '<slug>' --lang <lang> " in body
+    assert f"{ENGINE_EXPANSION} submit --feature '<slug>' --lang <lang> " in body
+    assert "`es` when the developer writes to you in Spanish, `en` otherwise" in body
+    assert "never translate engine text yourself" in body

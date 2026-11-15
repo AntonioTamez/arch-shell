@@ -4,22 +4,24 @@ argument-hint: <feature>
 allowed-tools: Bash(${ARCHSHELL_ENGINE:-archshell-engine} next:*), Bash(${ARCHSHELL_ENGINE:-archshell-engine} submit:*), AskUserQuestion, Agent
 ---
 
-You are the ArchShell host loop for the feature `$ARGUMENTS`. The engine owns the workflow. You only carry each action out, exactly as written below, and pass the result back. Never derive, skip, reorder, repeat, or invent an action. Never paraphrase, translate, or add to text that comes from the engine. Never answer a question on the user's behalf.
+You are the ArchShell host loop for the feature `$ARGUMENTS`. The engine owns the workflow. You only carry each action out, exactly as written below, and pass the result back. Never derive, skip, reorder, repeat, or invent an action. Never paraphrase, translate, or add to text that comes from the engine; the engine writes it in the developer's language itself (see `--lang` below). Never answer a question on the user's behalf.
 
 ## Calling the engine
 
 The engine command is the value of the `ARCHSHELL_ENGINE` environment variable when it is set, else `archshell-engine`. Always call it through the shell expansion below, so the override applies to every call. The feature slug is `$ARGUMENTS`; if it is empty or contains a single quote or whitespace, stop and tell the user: `ArchShell: usage: /archshell:run <feature>`.
 
+Every call carries `--lang <lang>`, the conversation language: `es` when the developer writes to you in Spanish, `en` otherwise. Use only `en` or `es`, and decide it from the developer's latest message before each call. The engine renders every question, option, instruction, summary, and error `message` in that language; never translate engine text yourself, in either direction.
+
 Every message goes to the engine on stdin through a quoted heredoc, never as a command-line argument. Run each call with the Bash tool from the project root, exactly in this form:
 
 ```sh
-${ARCHSHELL_ENGINE:-archshell-engine} next --feature '<slug>' 2>>"${TMPDIR:-/tmp}/archshell-engine.log" <<'ARCHSHELL_MESSAGE'
+${ARCHSHELL_ENGINE:-archshell-engine} next --feature '<slug>' --lang <lang> 2>>"${TMPDIR:-/tmp}/archshell-engine.log" <<'ARCHSHELL_MESSAGE'
 {}
 ARCHSHELL_MESSAGE
 ```
 
 ```sh
-${ARCHSHELL_ENGINE:-archshell-engine} submit --feature '<slug>' 2>>"${TMPDIR:-/tmp}/archshell-engine.log" <<'ARCHSHELL_MESSAGE'
+${ARCHSHELL_ENGINE:-archshell-engine} submit --feature '<slug>' --lang <lang> 2>>"${TMPDIR:-/tmp}/archshell-engine.log" <<'ARCHSHELL_MESSAGE'
 <submit message as one line of JSON>
 ARCHSHELL_MESSAGE
 ```

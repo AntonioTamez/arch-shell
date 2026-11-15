@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from archshell.adapters.catalogs import render
 from archshell.adapters.output_schemas import validate
 from archshell.adapters.state_store import (
     CorruptState,
@@ -16,7 +17,7 @@ from archshell.domain.workflow import FreshIds, Outcome, on_next, on_submit, Sub
 
 
 def first_state():
-    outcome = on_next(None, "probe", FreshIds("id-1", "n-1"))
+    outcome = on_next(None, "probe", FreshIds("id-1", "n-1"), render=render)
     assert isinstance(outcome, Outcome)
     return outcome.state
 
@@ -25,7 +26,7 @@ def second_state(state):
     sub = Submission(
         "probe", state.action.action_id, state.revision, None, None, {"text": "ok"}
     )
-    outcome = on_submit(state, sub, FreshIds("id-2", "n-2"), validate=validate)
+    outcome = on_submit(state, sub, FreshIds("id-2", "n-2"), validate=validate, render=render)
     assert isinstance(outcome, Outcome)
     return outcome.state
 
