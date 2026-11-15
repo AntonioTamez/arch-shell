@@ -15,7 +15,55 @@ archshell = { workspace = true }
 archshell-dotnet = { workspace = true }
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "import-linter==2.16",
+    "pytest>=8",
+]
 
 [tool.pytest.ini_options]
-testpaths = ["archshell-core/tests", "archshell-dotnet/tests"]
+testpaths = ["archshell-core/tests", "archshell-core/conformance", "archshell-dotnet/tests"]
+
+# Package boundaries (AD-1, AD-4). Run with `uv run lint-imports --no-cache`,
+# or through Python: see README "Boundaries".
+[tool.importlinter]
+root_packages = ["archshell", "archshell_dotnet"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+id = "core-never-imports-packs"
+name = "The core never imports a language pack"
+type = "forbidden"
+source_modules = ["archshell"]
+forbidden_modules = ["archshell_dotnet"]
+
+[[tool.importlinter.contracts]]
+id = "core-layers"
+name = "engine/cli above adapters above render above domain"
+type = "layers"
+containers = ["archshell"]
+layers = ["engine : cli", "adapters", "render", "domain"]
+
+[[tool.importlinter.contracts]]
+id = "inner-modules-stay-inner"
+name = "domain, render and ports never import adapters, engine or cli"
+type = "forbidden"
+source_modules = ["archshell.domain", "archshell.ports", "archshell.render"]
+forbidden_modules = ["archshell.adapters", "archshell.engine", "archshell.cli"]
+
+[[tool.importlinter.contracts]]
+# Forbidden list only; the stdlib-only allow-list is tests/test_boundaries.py.
+id = "domain-forbidden-imports"
+name = "domain never imports the forbidden packages"
+type = "forbidden"
+source_modules = ["archshell.domain"]
+forbidden_modules = [
+    "archshell.adapters",
+    "archshell.cli",
+    "archshell.engine",
+    "archshell.ports",
+    "archshell.render",
+    "archshell_dotnet",
+    "jinja2",
+    "jsonschema",
+    "yaml",
+]

@@ -18,3 +18,6 @@ obj/
 .vs/
 .vscode/
 .idea/
+
+# import-linter
+.import_linter_cache/
