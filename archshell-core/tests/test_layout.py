@@ -9,11 +9,10 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import run_engine
 
 from archshell.adapters.layout import Config, InvalidConfig, create_layout, load_config
 from archshell.domain import layout
-
-ENGINE = [sys.executable, "-m", "archshell.engine"]
 
 LAYOUT_PATHS = {
     ".gitignore",
@@ -38,14 +37,8 @@ def snapshot(root: Path) -> dict[str, bytes | None]:
 
 
 def engine(root: Path, *argv: str, stdin: dict | None = None) -> tuple[int, dict]:
-    proc = subprocess.run(
-        ENGINE + list(argv),
-        input=json.dumps({} if stdin is None else stdin).encode("utf-8"),
-        capture_output=True,
-        cwd=root,
-        timeout=60,
-    )
-    return proc.returncode, json.loads(proc.stdout.decode("utf-8"))
+    message = json.dumps({} if stdin is None else stdin).encode("utf-8")
+    return run_engine(root, *argv, stdin=message, single_line=False)
 
 
 def invalid_submit(action: dict) -> dict:

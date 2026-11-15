@@ -8,21 +8,15 @@ bytes (unchanged on every refusal).
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
+from conftest import Project as BaseProject
 
 from archshell.domain.workflow import FLOWS
 
-ENGINE = [sys.executable, "-m", "archshell.engine"]
 
-
-class Project:
-    def __init__(self, root: Path):
-        self.root = root
-
+class Project(BaseProject):
     def state_path(self, feature: str = "probe") -> Path:
         return self.root / ".archshell" / "state" / f"{feature}.yaml"
 
@@ -35,14 +29,6 @@ class Project:
     def state_bytes(self, feature: str = "probe") -> bytes | None:
         path = self.state_path(feature)
         return path.read_bytes() if path.exists() else None
-
-    def engine(self, *argv: str, stdin: bytes = b"{}") -> tuple[int, dict]:
-        proc = subprocess.run(
-            ENGINE + list(argv), input=stdin, capture_output=True, cwd=self.root, timeout=60
-        )
-        text = proc.stdout.decode("utf-8")
-        assert text.endswith("\n") and len(text.splitlines()) == 1, (text, proc.stderr)
-        return proc.returncode, json.loads(text)
 
     def next(self, feature: str = "probe") -> tuple[int, dict]:
         return self.engine("next", "--feature", feature)

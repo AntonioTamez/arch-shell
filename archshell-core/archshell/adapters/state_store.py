@@ -1,7 +1,7 @@
 """Cursor state on disk: per-feature lock file and revision compare-and-swap.
 
 State lives at `<root>/.archshell/state/<slug>.yaml`, serialized as sorted-key
-JSON (a YAML subset) until the canonical YAML emitter exists. The lock is
+JSON (a YAML subset); moving it to canonical YAML is deferred. The lock is
 `<root>/.archshell/locks/<slug>.lock`, taken by exclusive create. The prompt
 of a pending `llm_task` lives beside the state, at the project-relative path
 the action names (`.archshell/state/prompts/<action_id>.md`).
@@ -37,6 +37,17 @@ def serialize(state: CursorState) -> bytes:
     return (text + "\n").encode("utf-8")
 
 
+def _replace(path: Path, data: bytes) -> None:
+    """Write `data` to `<path>.tmp`, then move it over `path` with `os.replace`.
+
+    Bytes are written as given: no normalization, unlike `files.write_text`.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
 class StateStore:
     def __init__(self, root: Path):
         self.root = root
@@ -63,10 +74,7 @@ class StateStore:
                 return
         except FileNotFoundError:
             pass
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_bytes(data)
-        os.replace(tmp, path)
+        _replace(path, data)
 
     def lock_path(self, feature: str) -> Path:
         return path_of(self.root, layout.lock_file(feature))
@@ -115,8 +123,4 @@ class StateStore:
             )
         if state.revision <= current_revision:
             raise RevisionConflict("revision must increase")
-        path = self.state_path(state.feature)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_bytes(serialize(state))
-        os.replace(tmp, path)
+        _replace(self.state_path(state.feature), serialize(state))

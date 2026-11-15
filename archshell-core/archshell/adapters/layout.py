@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from archshell.adapters import yaml_read
-from archshell.adapters.files import path_of, write_text
+from archshell.adapters.files import format_errors, path_of, write_text
 from archshell.domain import layout
 from archshell.render.yaml_emit import Ordered, emit
 
@@ -26,7 +26,7 @@ class InvalidConfig(Exception):
     """`config.yaml` is unreadable or does not match `archshell/config/v1`."""
 
     def __init__(self, errors: list[tuple[str, str]]):
-        super().__init__("; ".join(f"{path}: {message}" for path, message in errors))
+        super().__init__(format_errors(errors))
         self.errors = errors
 
 

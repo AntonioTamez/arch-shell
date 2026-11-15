@@ -18,7 +18,8 @@ import os
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, BinaryIO, TextIO
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, BinaryIO, TextIO
 
 from archshell.adapters import catalogs
 from archshell.adapters.ids import fresh_ids
@@ -29,23 +30,25 @@ from archshell.adapters.state_store import (
     StateStore,
 )
 from archshell.domain import hooks, layout, workflow
+from archshell.domain.actions import Message
 from archshell.domain.messages import DEFAULT_LANG, LANGUAGES, MessageError, msg
-from archshell.domain.messages import Message as Text
+from archshell.domain.messages import Message as CatalogMessage
 from archshell.render.hosts import HOSTS, PayloadError
+
+if TYPE_CHECKING:
+    from archshell.adapters.layout import Config
 
 ERROR_SCHEMA = "archshell/error/v1"
 
 EXIT_OK = 0
 EXIT_PROTOCOL_ERROR = 2
 
-Message = dict[str, Any]
-
 
 class ProtocolError(Exception):
     """A refusal; `message` is a catalog message, rendered when it is emitted."""
 
     def __init__(
-        self, code: str, message: Text, details: dict[str, Any] | None = None,
+        self, code: str, message: CatalogMessage, details: dict[str, Any] | None = None,
         lang: str | None = None,
     ):
         super().__init__(message.key)
@@ -126,11 +129,7 @@ def validate_feature(feature: str) -> str:
 
 def require_flow(feature: str) -> None:
     if feature not in workflow.FLOWS:
-        raise ProtocolError(
-            "unknown_feature",
-            msg("error.unknown_feature", feature=feature),
-            {"features": sorted(workflow.FLOWS)},
-        )
+        raise refuse(workflow.unknown_feature(feature))
 
 
 def cmd_next(feature: str, message: Message, store: StateStore, lang: str) -> Message:
@@ -149,6 +148,35 @@ def cmd_next(feature: str, message: Message, store: StateStore, lang: str) -> Me
     return outcome.action.to_message()
 
 
+def _load_config_or_refuse(root: Path) -> Config:
+    """The project config, or an `invalid_config` refusal.
+
+    `load_config` is imported here, like the other submit-only imports.
+    """
+    from archshell.adapters.layout import InvalidConfig, load_config
+
+    try:
+        return load_config(root)
+    except InvalidConfig as exc:
+        raise ProtocolError(
+            "invalid_config", msg("error.invalid_config", config=layout.CONFIG),
+            {
+                "config": layout.CONFIG,
+                "errors": workflow.error_entries(workflow.cap_errors(exc.errors)),
+            },
+        ) from None
+
+
+def _log_submitted(feature: str, state: workflow.CursorState) -> None:
+    if state.attempts:  # nonzero only while the same step is being retried
+        log(
+            "submit_retry", feature=feature, revision=state.revision,
+            attempt=state.attempts, error_count=len(state.errors),
+        )
+    else:
+        log("submit_accepted", feature=feature, revision=state.revision)
+
+
 def cmd_submit(feature: str, message: Message, store: StateStore, lang: str) -> Message:
     submission = workflow.parse_submission(message)
     if isinstance(submission, workflow.Refusal):
@@ -160,20 +188,10 @@ def cmd_submit(feature: str, message: Message, store: StateStore, lang: str) -> 
             {"feature": feature, "message_feature": submission.feature},
         )
     require_flow(feature)
+    config = _load_config_or_refuse(store.root)
     # Imported here so `next` and the hooks do not pay for loading jsonschema.
     from archshell.adapters import output_schemas
-    from archshell.adapters.layout import InvalidConfig, load_config
 
-    try:
-        config = load_config(store.root)
-    except InvalidConfig as exc:
-        raise ProtocolError(
-            "invalid_config", msg("error.invalid_config", config=layout.CONFIG),
-            {
-                "config": layout.CONFIG,
-                "errors": [{"path": p, "message": m} for p, m in workflow.cap_errors(exc.errors)],
-            },
-        ) from None
     if store.read(feature) is None:
         # Refused before taking the lock, so the refusal creates no `.archshell/`
         # directory. State is written before any action reaches a host, so no
@@ -198,13 +216,7 @@ def cmd_submit(feature: str, message: Message, store: StateStore, lang: str) -> 
         assert state is not None  # on_submit refuses when there is no state
         store.ensure_prompt(outcome.state)
         store.write(outcome.state, expected_revision=state.revision)
-    if outcome.state.attempts:  # nonzero only while the same step is being retried
-        log(
-            "submit_retry", feature=feature, revision=outcome.state.revision,
-            attempt=outcome.state.attempts, error_count=len(outcome.state.errors),
-        )
-        return outcome.action.to_message()
-    log("submit_accepted", feature=feature, revision=outcome.state.revision)
+    _log_submitted(feature, outcome.state)
     return outcome.action.to_message()
 
 
@@ -277,6 +289,57 @@ def evaluate_hook(
     return hooks.on_stop(hook, feature)
 
 
+def _fail_closed(err: ProtocolError) -> Message:
+    """The `block` verdict a fail-closed hook replies with, carrying `err` in `error`."""
+    result = hooks.error_block(err.code, err.text()).to_message()
+    result["error"] = err.to_message()
+    return result
+
+
+def _hook_error(command: str, exc: Exception) -> ProtocolError:
+    """`exc` as a protocol error, logged; anything unexpected is `internal_error`."""
+    if isinstance(exc, ProtocolError):
+        log("hook_error", command=command, code=exc.code)
+        return exc
+    log("internal_error", command=command, error=repr(exc))
+    return ProtocolError("internal_error", msg("error.internal"))
+
+
+def _evaluate_payload(
+    command: str, options: dict[str, str], host: ModuleType | None, stdin: BinaryIO, root: Path
+) -> Message:
+    """Read the hook payload (in the host's shape with `--host`) and return the verdict."""
+    payload = read_message(stdin)
+    if host is not None:
+        try:
+            payload = host.parse_payload(command, payload)
+        except PayloadError as exc:
+            raise ProtocolError("invalid_message", msg("error.hook_payload", error=exc)) from None
+    return evaluate_hook(command, payload, options.get("--feature"), root).to_message()
+
+
+def _render_for_host(
+    command: str, host: ModuleType, result: Message, fail_closed: bool, stdout: TextIO
+) -> int:
+    """Write the verdict as the host's hook output.
+
+    A broken renderer still blocks `guard-write` (fail closed); for the other
+    hooks it renders nothing and exits 0.
+    """
+    try:
+        rendered = host.render_verdict(command, result)
+    except Exception as exc:  # noqa: BLE001 - guard-write fails closed on a broken renderer
+        log("internal_error", command=command, error=repr(exc))
+        if not fail_closed:
+            return EXIT_OK
+        emit(_fail_closed(ProtocolError("internal_error", msg("error.host_render"))), stdout)
+        return EXIT_PROTOCOL_ERROR
+    if rendered:
+        stdout.write(rendered + "\n")
+        stdout.flush()
+    return EXIT_OK
+
+
 def run_hook(command: str, args: Sequence[str], stdin: BinaryIO, stdout: TextIO, root: Path) -> int:
     """Run one hook. `guard-write` fails closed: any error is a `block`.
 
@@ -294,49 +357,22 @@ def run_hook(command: str, args: Sequence[str], stdin: BinaryIO, stdout: TextIO,
         options = parse_hook_options(command, args)
         if "--host" in options:
             host = HOSTS[options["--host"]]
-        payload = read_message(stdin)
-        if host is not None:
-            try:
-                payload = host.parse_payload(command, payload)
-            except PayloadError as exc:
-                raise ProtocolError("invalid_message", msg("error.hook_payload", error=exc)) from None
-        verdict = evaluate_hook(command, payload, options.get("--feature"), root)
-        result: Message = verdict.to_message()
+        result = _evaluate_payload(command, options, host, stdin, root)
     except Exception as exc:  # noqa: BLE001 - fail closed, never a traceback
-        if isinstance(exc, ProtocolError):
-            err = exc
-            log("hook_error", command=command, code=err.code)
-        else:
-            err = ProtocolError("internal_error", msg("error.internal"))
-            log("internal_error", command=command, error=repr(exc))
+        err = _hook_error(command, exc)
         if not fail_closed:
             if host is not None:
                 return EXIT_OK
             emit(err.to_message(), stdout)
             return EXIT_PROTOCOL_ERROR
-        result = hooks.error_block(err.code, err.text()).to_message()
-        result["error"] = err.to_message()
+        result = _fail_closed(err)
         exit_code = EXIT_PROTOCOL_ERROR
     if result["verdict"] == hooks.BLOCK:
         log("hook_block", command=command, code=result["code"])
     if host is None:
         emit(result, stdout)
         return exit_code
-    try:
-        rendered = host.render_verdict(command, result)
-    except Exception as exc:  # noqa: BLE001 - a broken renderer still blocks
-        log("internal_error", command=command, error=repr(exc))
-        if not fail_closed:
-            return EXIT_OK
-        err = ProtocolError("internal_error", msg("error.host_render"))
-        result = hooks.error_block(err.code, err.text()).to_message()
-        result["error"] = err.to_message()
-        emit(result, stdout)
-        return EXIT_PROTOCOL_ERROR
-    if rendered:
-        stdout.write(rendered + "\n")
-        stdout.flush()
-    return EXIT_OK
+    return _render_for_host(command, host, result, fail_closed, stdout)
 
 
 def log(event: str, **fields: Any) -> None:

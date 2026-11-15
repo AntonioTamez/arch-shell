@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from archshell.adapters import yaml_read
-from archshell.adapters.files import path_of
+from archshell.adapters.files import _write_synced, format_errors, path_of
 from archshell.domain import layout, records
 from archshell.domain.workflow import is_valid_slug
 from archshell.render.normalize import to_bytes
@@ -40,7 +40,7 @@ class InvalidRecord(Exception):
     """
 
     def __init__(self, errors: list[tuple[str, str]], file: str | None = None):
-        detail = "; ".join(f"{path}: {message}" for path, message in errors)
+        detail = format_errors(errors)
         super().__init__(f"{file}: {detail}" if file else detail)
         self.errors = errors
         self.file = file
@@ -56,6 +56,11 @@ def fingerprint(content: Any) -> str:
 
 
 _content_fingerprint = fingerprint  # `append_record`'s `fingerprint` argument shadows it
+
+
+def _require_slug(feature: str) -> None:
+    if not is_valid_slug(feature):
+        raise InvalidRecord([("$.feature", f"{feature!r} is not a valid feature slug")])
 
 
 @dataclass(frozen=True)
@@ -81,19 +86,15 @@ def append_record(
     given they must agree. `confirmed_at` defaults to the current UTC time.
     Raises `InvalidRecord` (nothing written) for an invalid record.
     """
-    if not is_valid_slug(feature):
-        raise InvalidRecord([("$.feature", f"{feature!r} is not a valid feature slug")])
-    if fingerprint is None and content is not None:
-        try:
-            fingerprint = _content_fingerprint(content)
-        except EmitError as exc:
-            raise InvalidRecord([("$.content", str(exc))]) from None
-    elif fingerprint is not None and content is not None:
+    _require_slug(feature)
+    if content is not None:
         try:
             expected = _content_fingerprint(content)
         except EmitError as exc:
             raise InvalidRecord([("$.content", str(exc))]) from None
-        if fingerprint != expected:
+        if fingerprint is None:
+            fingerprint = expected
+        elif fingerprint != expected:
             raise InvalidRecord([("$.fingerprint", f"does not match content ({expected})")])
     if confirmed_at is None:
         confirmed_at = records.format_timestamp(datetime.now(UTC))
@@ -144,8 +145,7 @@ def read_records(root: Path, feature: str) -> list[Record]:
     feature, seq, or flow than its path, or repeats another file's seq.
     Temporary files of an interrupted writer (names starting with `.`) are skipped.
     """
-    if not is_valid_slug(feature):
-        raise InvalidRecord([("$.feature", f"{feature!r} is not a valid feature slug")])
+    _require_slug(feature)
     directory = path_of(root, layout.records_dir(feature))
     try:
         entries = sorted(directory.iterdir(), key=lambda path: path.name)
@@ -228,10 +228,7 @@ def _create_exclusive(path: Path, data: bytes, tmp_dir: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=tmp_dir, prefix=f".{path.name}.", suffix=".tmp")
     try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+        _write_synced(fd, data)
         os.chmod(tmp, 0o644)  # mkstemp creates 0600
         try:
             os.link(tmp, path)
@@ -248,10 +245,7 @@ def _create_in_place(path: Path, data: bytes) -> None:
     """Fallback without hard links: `O_CREAT | O_EXCL`, then write and fsync."""
     fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o644)
     try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+        _write_synced(fd, data)
     except BaseException:
         path.unlink(missing_ok=True)  # our own partial file, never an existing record
         raise

@@ -40,7 +40,8 @@ def msg(key: str, **args: Any) -> Message:
 
 def placeholders(template: str) -> frozenset[str]:
     """The placeholder names of a template; refuses a brace outside a placeholder."""
-    if "{" in PLACEHOLDER.sub("", template) or "}" in PLACEHOLDER.sub("", template):
+    literal = PLACEHOLDER.sub("", template)
+    if "{" in literal or "}" in literal:
         raise MessageError(f"template has a brace outside a {{name}} placeholder: {template!r}")
     return frozenset(PLACEHOLDER.findall(template))
 
