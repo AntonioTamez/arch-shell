@@ -4,17 +4,26 @@ The host plugin holds no logic and has no Python, so it is checked as files:
 the manifest, the host protocol declaration, well-formed frontmatter, `run.md` covering the whole closed
 action set and the protocol rules it must state, the plugin agent, the hook
 wiring, and the `ARCHSHELL_ENGINE` override on every engine call. The
-engine-interface run (AD-18 `human_ui`) arrives with story 1.13.
+engine-interface run (AD-18 `human_ui`, story 1.13) drives the engine through
+`tests/conftest.py`'s `ScriptedHost`, which follows `run.md` and runs the
+`hooks.json` commands.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
-from archshell.domain.actions import ACTION_SCHEMA, ACTION_TYPES
+from archshell.domain.actions import ACTION_SCHEMA, ACTION_TYPES, action_from_message
+
+# The shared harness lives with the tests; this suite also runs on its own.
+TESTS = Path(__file__).resolve().parents[1] / "tests"
+if str(TESTS) not in sys.path:
+    sys.path.insert(0, str(TESTS))
+from conftest import ScriptedHost  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 PLUGIN = REPO / "archshell-claude-code"
@@ -233,3 +242,42 @@ def test_run_passes_the_conversation_language_on_every_call():
     assert f"{ENGINE_EXPANSION} submit --feature '<slug>' --lang <lang> " in body
     assert "`es` when the developer writes to you in Spanish, `en` otherwise" in body
     assert "never translate engine text yourself" in body
+
+
+# --- engine interface: the `human_ui` run (story 1.13, AD-18) -----------------
+
+
+@pytest.mark.parametrize("lang", ["en", "es"])
+def test_engine_interface_human_ui_run(tmp_path, lang):
+    root = tmp_path / "proj"
+    root.mkdir()
+    host = ScriptedHost(root, lang, log_dir=tmp_path / "host-tmp")
+    actions = host.run_flow("probe") + host.run_flow("probe-report")
+    assert {a["type"] for a in actions} == set(ACTION_TYPES)
+    for action in actions:
+        assert action_from_message(action).type == action["type"]
+    # Only `ask` and `confirm` answers carry a nonce, and always `human_ui`.
+    for message in host.submissions:
+        pending = next(a for a in actions if a["action_id"] == message["action_id"])
+        if pending["type"] in ("ask", "confirm"):
+            assert message["nonce"] == pending["nonce"]
+            assert message["source"] == "human_ui"
+        else:
+            assert "nonce" not in message and "source" not in message
+    assert [r.path for r in host.records] == [
+        ".archshell/records/probe/0001-plan.yaml",
+        ".archshell/records/probe/0002-plan.yaml",
+    ]
+
+
+def test_engine_interface_refuses_a_question_answered_without_human_ui(tmp_path):
+    root = tmp_path / "proj"
+    root.mkdir()
+    host = ScriptedHost(root, log_dir=tmp_path / "host-tmp")
+    ask = host.answer(host.next("probe"))
+    assert ask["type"] == "ask"
+    message = host.submission(ask)
+    del message["source"]
+    code, reply = host.submit(message)
+    assert code == 2 and reply["code"] == "invalid_source"
+    assert reply["details"] == {"expected_source": "human_ui"}

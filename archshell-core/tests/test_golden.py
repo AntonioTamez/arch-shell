@@ -7,8 +7,9 @@ with the committed `golden/manifest.sha256` (`<sha256>  <name>` lines, sorted).
 CI runs this on Windows, Linux, and macOS: all three matching one committed
 manifest means they match each other.
 
-To update the manifest after an intended change, copy the "actual manifest"
-printed by the failing test into `golden/manifest.sha256`.
+The manifest also holds `no-op/...` entries, checked by `test_no_op_flow.py`;
+this test ignores them. To update the manifest after an intended change,
+replace its other lines with the "actual manifest" printed by the failing test.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from archshell.render.templates import render
 from archshell.render.yaml_emit import emit
 
 GOLDEN = Path(__file__).parent / "golden"
+NO_OP_PREFIX = "no-op/"
 
 
 def _outputs() -> dict[str, str]:
@@ -46,7 +48,9 @@ def test_golden_outputs_match_committed_sha256(tmp_path):
         data = write_text(tmp_path / name, text)
         assert (tmp_path / name).read_bytes() == data
         hashes[name] = hashlib.sha256(data).hexdigest()
-    expected = (GOLDEN / "manifest.sha256").read_bytes().decode("utf-8")
+    lines = (GOLDEN / "manifest.sha256").read_bytes().decode("utf-8").splitlines(keepends=True)
+    # `no-op/...` entries belong to test_no_op_flow.py (the end-to-end run).
+    expected = "".join(line for line in lines if not line.split("  ", 1)[1].startswith(NO_OP_PREFIX))
     actual = _manifest(hashes)
     assert actual == expected, f"golden bytes differ; actual manifest:\n{actual}"
 
@@ -66,3 +70,9 @@ def test_golden_outputs_are_normalized():
         assert b"\r" not in data, name
         assert not data.startswith(b"\xef\xbb\xbf"), name
         assert data.endswith(b"\n") and not data.endswith(b"\n\n"), name
+
+
+def test_manifest_is_sorted_by_name():
+    lines = (GOLDEN / "manifest.sha256").read_bytes().decode("utf-8").splitlines()
+    names = [line.split("  ", 1)[1] for line in lines]
+    assert names == sorted(names) and len(set(names)) == len(names)

@@ -60,6 +60,11 @@ jobs:
           uv run python -c 'import json, sys; m = json.loads(sys.argv[1]); assert (m["schema"], m["type"], m["revision"]) == ("archshell/action/v1", "llm_task", 1), m' "$out"
           uv run archshell --version
 
+      - name: no-op flow (scripted Claude Code host, all six action types, hooks, records, both catalogs)
+        run: |
+          uv run python -m pytest -v archshell-core/tests/test_no_op_flow.py
+          uv run python -m pytest -v archshell-core/conformance/test_plugin_conformance.py -k engine_interface
+
       - name: build analyzer
         run: dotnet build archshell-dotnet/analyzer --configuration Release
 

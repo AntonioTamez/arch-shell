@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 from conftest import Project as BaseProject
-from conftest import engine_process, single_json_line, tree
+from conftest import engine_process, single_json_line, stop_payload, tool_payload, tree
 
 from archshell.domain import hooks
 from archshell.render.hosts import claude_code
@@ -203,15 +203,7 @@ def test_guard_write_is_within_nfr1(project):
 
 
 def pre_tool_use(project: Project, tool: str, path: str) -> dict:
-    field = "notebook_path" if tool == "NotebookEdit" else "file_path"
-    return {
-        "session_id": "s",
-        "transcript_path": "t.jsonl",
-        "cwd": str(project.root),
-        "hook_event_name": "PreToolUse",
-        "tool_name": tool,
-        "tool_input": {field: path},
-    }
+    return tool_payload(project.root, tool, path)
 
 
 @pytest.mark.parametrize("tool", ["Write", "Edit", "MultiEdit", "NotebookEdit"])
@@ -271,8 +263,7 @@ def test_claude_code_post_tool_use_bad_payload_is_silent(project):
 
 @pytest.mark.parametrize("active", [False, True])
 def test_claude_code_stop_allow_is_silent(project, active):
-    payload = {"cwd": str(project.root), "hook_event_name": "Stop", "stop_hook_active": active}
-    assert project.host("on-stop", payload) == (0, "")
+    assert project.host("on-stop", stop_payload(project.root, active)) == (0, "")
 
 
 # --- pure renderer: block verdicts for PostToolUse and Stop -------------------
