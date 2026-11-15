@@ -25,7 +25,7 @@ from archshell.adapters.state_store import (
     RevisionConflict,
     StateStore,
 )
-from archshell.domain import hooks, workflow
+from archshell.domain import hooks, layout, workflow
 from archshell.render.hosts import HOSTS, PayloadError
 
 ERROR_SCHEMA = "archshell/error/v1"
@@ -125,11 +125,29 @@ def cmd_submit(feature: str, message: Message, store: StateStore) -> Message:
     require_flow(feature)
     # Imported here so `next` and the hooks do not pay for loading jsonschema.
     from archshell.adapters import output_schemas
+    from archshell.adapters.layout import InvalidConfig, load_config
+
+    try:
+        config = load_config(store.root)
+    except InvalidConfig as exc:
+        raise ProtocolError(
+            "invalid_config", f"{layout.CONFIG} is invalid",
+            {
+                "config": layout.CONFIG,
+                "errors": [{"path": p, "message": m} for p, m in workflow.cap_errors(exc.errors)],
+            },
+        ) from None
+    if store.read(feature) is None:
+        # Refused before taking the lock, so the refusal creates no `.archshell/`
+        # directory. State is written before any action reaches a host, so no
+        # valid submit can race a first `next` here.
+        raise refuse(workflow.NO_PENDING_ACTION)
 
     with store.locked(feature):
         state = store.read(feature)
         outcome = workflow.on_submit(
-            state, submission, fresh_ids(), validate=output_schemas.validate
+            state, submission, fresh_ids(),
+            validate=output_schemas.validate, max_retries=config.max_retries,
         )
         if isinstance(outcome, workflow.Refusal):
             if outcome.code == "invalid_output":
@@ -319,14 +337,14 @@ def run(
         except LockHeld:
             raise ProtocolError(
                 "locked", "another engine invocation holds this feature's lock",
-                {"lock": f".archshell/locks/{feature}.lock"},
+                {"lock": layout.lock_file(feature)},
             ) from None
         except RevisionConflict as exc:
             raise ProtocolError("stale_action", f"state changed concurrently: {exc}") from None
         except CorruptState:
             raise ProtocolError(
                 "invalid_state", "the feature's state file is unreadable",
-                {"state": f".archshell/state/{feature}.yaml"},
+                {"state": layout.state_file(feature)},
             ) from None
     except ProtocolError as err:
         log("protocol_error", code=err.code)

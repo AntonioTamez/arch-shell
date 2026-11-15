@@ -14,6 +14,11 @@ from pathlib import Path
 from archshell.render.normalize import to_bytes
 
 
+def path_of(root: Path, relative: str) -> Path:
+    """The path of a project-relative POSIX path under `root`."""
+    return root.joinpath(*relative.split("/"))
+
+
 def read_text(path: Path) -> str:
     """Read `path` as UTF-8 text (a template, for instance). Bytes are not altered."""
     return path.read_bytes().decode("utf-8")
