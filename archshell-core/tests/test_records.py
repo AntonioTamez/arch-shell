@@ -117,6 +117,10 @@ def test_concurrent_writers_get_distinct_seqs(tmp_path):
         ({"flow": "approval"}, "$.flow"),
         ({"feature": "Cancel_Appointment"}, "$.feature"),
         ({"feature": "../escape"}, "$.feature"),
+        ({"feature": "abc\n"}, "$.feature"),
+        ({"fingerprint": "sha256:" + "0" * 64 + "\n", "content": None}, "$.fingerprint"),
+        ({"confirmed_by": "\x0b"}, "$.confirmed_by"),
+        ({"confirmed_by": "\u00a0"}, "$.confirmed_by"),
         ({"content": None, "fingerprint": "sha256:abc"}, "$.fingerprint"),
         ({"content": None, "fingerprint": None}, "$.fingerprint"),
         ({"fingerprint": "sha256:" + "0" * 64}, "$.fingerprint"),
@@ -151,6 +155,12 @@ def _drop_fingerprint(path: Path) -> None:
     path.write_text("".join(line for line in lines if not line.startswith("fingerprint:")), encoding="utf-8")
 
 
+def _newline_fingerprint(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    start = text.index('fingerprint: "') + len('fingerprint: "') + len("sha256:") + 64
+    path.write_text(text[:start] + "\\n" + text[start:], encoding="utf-8")  # YAML escape: value ends in LF
+
+
 @pytest.mark.parametrize(
     ("corrupt", "name", "error_path"),
     [
@@ -161,6 +171,7 @@ def _drop_fingerprint(path: Path) -> None:
         (lambda p: p.write_bytes(b"\xff\n"), "0001-plan.yaml", "$"),
         (lambda p: p.with_name("notes.txt").write_bytes(b"x\n"), "notes.txt", "$"),
         (lambda p: p.with_name("0001-approval.yaml").write_bytes(b"x\n"), "0001-approval.yaml", "$"),
+        (_newline_fingerprint, "0001-plan.yaml", "$.fingerprint"),
         (lambda p: p.with_name("0001-contract.yaml").write_bytes(
             p.read_bytes().replace(b"flow: plan", b"flow: contract")), "0001-plan.yaml", "$.seq"),
     ],

@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from archshell.domain import layout
+from archshell.domain.workflow import is_valid_slug
 from archshell.render.normalize import to_bytes
 from archshell.render.yaml_emit import Ordered, emit
 
@@ -22,6 +23,7 @@ SEQ_WIDTH = 4
 MAX_SEQ = 10**SEQ_WIDTH - 1
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
+_FINGERPRINT = re.compile(r"sha256:[0-9a-f]{64}")
 _FILENAME = re.compile(r"([0-9]{4})-([a-z]+(?:-[a-z]+)*)\.yaml")
 
 
@@ -102,10 +104,26 @@ def build_record(
 def semantic_errors(document: Any) -> list[tuple[str, str]]:
     """Errors the schema cannot express, as (JSON path, message).
 
-    Run after schema validation: `confirmed_at` must be a real UTC time.
+    Run after schema validation. JSON Schema `pattern` is a search in which
+    `$` also matches before a final newline, so the whole values are checked
+    here: `feature` is a slug, `flow` is in the vocabulary, `fingerprint` is
+    exactly `sha256:<64 hex>`, `confirmed_by` is not blank, and
+    `confirmed_at` is a real UTC time.
     """
     errors: list[tuple[str, str]] = []
-    if isinstance(document, dict) and isinstance(document.get("confirmed_at"), str):
+    if not isinstance(document, dict):
+        return errors
+    if "feature" in document and not is_valid_slug(document["feature"]):
+        errors.append(("$.feature", f"{document['feature']!r} is not a valid feature slug"))
+    if "flow" in document and document["flow"] not in layout.RECORD_FLOWS:
+        errors.append(("$.flow", f"{document['flow']!r} is not a record flow"))
+    fingerprint = document.get("fingerprint")
+    if isinstance(fingerprint, str) and _FINGERPRINT.fullmatch(fingerprint) is None:
+        errors.append(("$.fingerprint", f"{fingerprint!r} is not sha256:<64 hex>"))
+    confirmed_by = document.get("confirmed_by")
+    if isinstance(confirmed_by, str) and not confirmed_by.strip():
+        errors.append(("$.confirmed_by", "must not be blank"))
+    if isinstance(document.get("confirmed_at"), str):
         try:
             datetime.strptime(document["confirmed_at"], TIMESTAMP_FORMAT)
         except ValueError:

@@ -3,7 +3,7 @@
 `append_record` never touches an existing file. It picks the feature's next
 `seq`, claims it by exclusive create of `.archshell/locks/records/<feature>/<seq>.claim`
 (gitignored), checks that no record already uses that `seq`, then writes the
-record to a temporary file in the feature directory, fsyncs it, and hard-links
+record to a temporary file in the claims directory, fsyncs it, and hard-links
 it to its final name, which fails rather than replace an existing path. A
 record is therefore either fully present or absent. Writers racing for one
 `seq` each end up with a different one. Without hard-link support the record is
@@ -68,6 +68,8 @@ def append_record(
     given they must agree. `confirmed_at` defaults to the current UTC time.
     Raises `InvalidRecord` (nothing written) for an invalid record.
     """
+    if not is_valid_slug(feature):
+        raise InvalidRecord([("$.feature", f"{feature!r} is not a valid feature slug")])
     if fingerprint is None and content is not None:
         try:
             fingerprint = records.fingerprint(content)
@@ -112,7 +114,7 @@ def append_record(
             _check(document)
             relative = records.record_path(feature, seq, flow)
             try:
-                _create_exclusive(path_of(root, relative), to_bytes(emit(document)))
+                _create_exclusive(path_of(root, relative), to_bytes(emit(document)), claims)
             except FileExistsError:
                 seq += 1
                 continue
@@ -204,10 +206,14 @@ def _claim(claims: Path, claim: Path) -> bool:
     return True
 
 
-def _create_exclusive(path: Path, data: bytes) -> None:
-    """Create `path` holding `data`; FileExistsError when it exists. Never replaces."""
+def _create_exclusive(path: Path, data: bytes, tmp_dir: Path) -> None:
+    """Create `path` holding `data`; FileExistsError when it exists. Never replaces.
+
+    The temporary file lives in `tmp_dir` (the gitignored claims directory,
+    on the same filesystem), so a killed writer leaves nothing under `records/`.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=tmp_dir, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
