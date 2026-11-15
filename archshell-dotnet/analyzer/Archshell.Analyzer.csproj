@@ -8,7 +8,7 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <AssemblyName>archshell-analyzer</AssemblyName>
     <RootNamespace>Archshell.Analyzer</RootNamespace>
-    <Version>0.1.0</Version>
+    <Version>0.1.0-rc.1</Version>
     <InvariantGlobalization>true</InvariantGlobalization>
 
     <PackAsTool>true</PackAsTool>
@@ -16,6 +16,8 @@
     <PackageId>Archshell.Analyzer</PackageId>
     <RollForward>LatestMajor</RollForward>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/AntonioTamez/arch-shell</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
   </PropertyGroup>
 
   <ItemGroup>

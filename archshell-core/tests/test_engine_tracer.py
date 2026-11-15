@@ -90,4 +90,4 @@ def test_cli_version():
     proc = run(CLI + ["--version"])
     assert proc.returncode == 0
     assert proc.stdout.decode("utf-8").strip() == f"archshell {__version__}"
-    assert __version__ == "0.1.0"
+    assert __version__ == "0.1.0rc1"

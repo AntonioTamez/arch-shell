@@ -1,6 +1,6 @@
 """Core-owned JSON Schemas for model outputs, validated with draft 2020-12.
 
-Schemas live in `archshell-core/schemas/` (shipped beside the `archshell`
+Schemas live in `archshell/schemas/` (shipped inside the `archshell`
 package), one file per schema id: `archshell/<kind>/v<n>` is `<kind>-v<n>.json`
 and its `$id` must equal the id. The domain receives `validate` as a plain
 function and never touches files or the schema library.
@@ -18,7 +18,7 @@ from jsonschema import Draft202012Validator
 
 import archshell
 
-SCHEMAS_DIR = Path(archshell.__file__).resolve().parent.parent / "schemas"
+SCHEMAS_DIR = Path(archshell.__file__).resolve().parent / "schemas"
 SCHEMA_ID_PATTERN = re.compile(r"archshell/([a-z0-9]+(?:-[a-z0-9]+)*)/v([1-9][0-9]*)")
 
 

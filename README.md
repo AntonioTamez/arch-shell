@@ -9,10 +9,13 @@ ArchShell: an architecture shell that keeps an AI coding agent inside a confirme
 | `pyproject.toml`, `uv.lock` | uv workspace root; one lockfile for all Python packages |
 | `archshell-core/` | distribution `archshell`: domain, render, ports, adapters, and the executables `archshell-engine` (host protocol) and `archshell` (human/CI commands); `conformance/` holds the extension conformance suite |
 | `archshell-dotnet/` | distribution `archshell-dotnet`: the .NET language pack (`archshell_dotnet/`) and the Roslyn analyzer (`analyzer/`, `net10.0` .NET tool) |
-| `archshell-claude-code/` | Claude Code host plugin; holds no logic and forwards to `archshell-engine` |
+| `archshell-claude-code/` | Claude Code host plugin; holds no logic and forwards to `archshell-engine`; `archshell-host.json` declares the action protocol it speaks |
 | `.claude-plugin/marketplace.json` | local marketplace that lists the plugin |
 | `global.json` | pins the .NET SDK band (10.0.4xx, `rollForward: latestFeature`) |
 | `.github/workflows/ci.yml` | CI on Ubuntu, Windows, and macOS |
+| `.github/workflows/release.yml` | signed pre-release publishing to TestPyPI and GitHub Packages (see [Releases](#releases)) |
+| `scripts/release_check.py` | stdlib release gate: tag shape, versions, compatibility declarations |
+| `docs/compatibility.md` | compatibility matrix, one row per release |
 | `.gitattributes` | forces LF for every text file |
 
 ## Local setup
@@ -111,7 +114,7 @@ A submit echoes `feature`, `action_id`, and `revision`, and carries `result` (an
 {"schema":"archshell/submit/v1","feature":"probe","action_id":"…","revision":2,"nonce":"…","source":"human_ui","result":{"answer":"yes"}}
 ```
 
-An `llm_task` result must match the core JSON Schema (draft 2020-12, `archshell-core/schemas/`) that its step names. Every `llm_task` today uses `archshell/llm-text/v1`: an object with exactly one property, `text`, a non-empty string, e.g. `{"text":"…"}`. The engine validates the result on `submit`, under the lock, after the `action_id`/`revision` checks. An invalid result re-issues the same step as a new `llm_task` (fresh `action_id`, `revision` +1, new `prompt_file`) whose prompt is the step's prompt followed by `Your previous answer did not match archshell/llm-text/v1:` and one `- <path>: <message>` line per schema error (path as a JSON path such as `$` or `$.text`). At most `max_retries` retries (default 2, set in `.archshell/config.yaml`) are issued per step; the next invalid result is refused with `invalid_output` and the state stays as it was, with the last retry still pending. The retry count is kept in the state file (`attempts`, with the errors that caused the latest retry in `errors`) and resets when the cursor advances. A stale submit is refused before validation and does not count. `ask`, `confirm`, and `instruct_agent` results are not schema-checked. The host never retries on its own: a retry is simply the next `llm_task` it receives.
+An `llm_task` result must match the core JSON Schema (draft 2020-12, `archshell-core/archshell/schemas/`) that its step names. Every `llm_task` today uses `archshell/llm-text/v1`: an object with exactly one property, `text`, a non-empty string, e.g. `{"text":"…"}`. The engine validates the result on `submit`, under the lock, after the `action_id`/`revision` checks. An invalid result re-issues the same step as a new `llm_task` (fresh `action_id`, `revision` +1, new `prompt_file`) whose prompt is the step's prompt followed by `Your previous answer did not match archshell/llm-text/v1:` and one `- <path>: <message>` line per schema error (path as a JSON path such as `$` or `$.text`). At most `max_retries` retries (default 2, set in `.archshell/config.yaml`) are issued per step; the next invalid result is refused with `invalid_output` and the state stays as it was, with the last retry still pending. The retry count is kept in the state file (`attempts`, with the errors that caused the latest retry in `errors`) and resets when the cursor advances. A stale submit is refused before validation and does not count. `ask`, `confirm`, and `instruct_agent` results are not schema-checked. The host never retries on its own: a retry is simply the next `llm_task` it receives.
 
 Cursor state lives at `.archshell/state/<slug>.yaml` (sorted-key JSON; gitignored once the layout's `.archshell/.gitignore` exists, see below). Every write is a revision compare-and-swap under the lock file `.archshell/locks/<slug>.lock`. If an engine process is killed while holding the lock, delete the lock file by hand. A refused command never changes the state file.
 
@@ -128,7 +131,7 @@ Every engine-owned path is named in one module, `archshell.domain.layout`. `arch
 | `.archshell/locks/` | no | per-feature lock files |
 | `.archshell/txn.json` | no | reserved for the transaction journal |
 
-`config.yaml` is written with the canonical YAML emitter and read with the restricted-subset reader, then validated against `archshell-core/schemas/config-v1.json`:
+`config.yaml` is written with the canonical YAML emitter and read with the restricted-subset reader, then validated against `archshell-core/archshell/schemas/config-v1.json`:
 
 ```yaml
 schema: archshell/config/v1
@@ -169,7 +172,7 @@ content:
 | `derived` | yes | `true` when the content is derived with no new decisions (FR-59) |
 | `content` | no | the confirmed content |
 
-No other keys are allowed. Records are **append-only**: `archshell.adapters.records.append_record(root, …)` validates the record against `archshell-core/schemas/record-v1.json`, then creates the next file exclusively and never replaces or edits an existing one. Concurrent writers claim a `seq` by exclusive create of `.archshell/locks/records/<feature>/<seq>.claim` (gitignored, removed after the write), so each gets a distinct `seq`; the record is written to a temporary file, fsynced, and hard-linked into place, so it is either fully present or absent. A writer killed mid-write may leave a gap in the sequence. `read_records(root, feature)` returns a feature's records in `seq` order, each validated, and raises `InvalidRecord` naming the file when one fails the schema, is not a `<seq>-<flow>.yaml` name, or names a different feature, seq, or flow than its path. No command writes records yet; agents still cannot write under `.archshell/`.
+No other keys are allowed. Records are **append-only**: `archshell.adapters.records.append_record(root, …)` validates the record against `archshell-core/archshell/schemas/record-v1.json`, then creates the next file exclusively and never replaces or edits an existing one. Concurrent writers claim a `seq` by exclusive create of `.archshell/locks/records/<feature>/<seq>.claim` (gitignored, removed after the write), so each gets a distinct `seq`; the record is written to a temporary file, fsynced, and hard-linked into place, so it is either fully present or absent. A writer killed mid-write may leave a gap in the sequence. `read_records(root, feature)` returns a feature's records in `seq` order, each validated, and raises `InvalidRecord` naming the file when one fails the schema, is not a `<seq>-<flow>.yaml` name, or names a different feature, seq, or flow than its path. No command writes records yet; agents still cannot write under `.archshell/`.
 
 Until real feature workflows exist, two built-in flows exercise the action set: `probe` (`llm_task` → `ask` → `confirm` → `instruct_agent` → `done`) and `probe-report` (`llm_task` → `report`).
 
@@ -328,3 +331,53 @@ The plugin ships `archshell-claude-code/hooks/hooks.json`, which Claude Code loa
 | Stop | (all) | `on-stop --host claude-code` |
 
 After updating the plugin (`/plugin` → update, then restart Claude Code), ask the agent to create `.archshell/test.txt`. Claude Code refuses the write and shows the engine's reason (`ArchShell: .archshell/test.txt is engine-owned. …`). Ordinary edits proceed with no hook output. Writes made through shell commands are not intercepted; `archshell verify` in CI is the real guard.
+
+## Releases
+
+Only signed pre-releases are published: tags `vX.Y.Z-(alpha|beta|rc).N`. `archshell` and `archshell-dotnet` go to [TestPyPI](https://test.pypi.org/); `Archshell.Analyzer` goes to GitHub Packages (NuGet). Nothing is published to PyPI or nuget.org, and stable tags are refused.
+
+### Versions and the compatibility matrix
+
+The committed files are the source of truth; the release refuses a tag that does not match them and never rewrites a version. For tag `v0.1.0-rc.1`:
+
+| File | Value |
+| --- | --- |
+| `archshell-core/pyproject.toml`, `archshell-dotnet/pyproject.toml`, `uv.lock` | `0.1.0rc1` (PEP 440) |
+| `archshell-dotnet/analyzer/Archshell.Analyzer.csproj` `<Version>`, `archshell_dotnet.ANALYZER_VERSION` | `0.1.0-rc.1` (SemVer) |
+| `archshell-claude-code/.claude-plugin/plugin.json` `version` | `0.1.0-rc.1` (SemVer) |
+| `archshell-dotnet/pyproject.toml` `archshell` dependency (the pack's core range) | must include the core version, e.g. `>=0.1.0rc1,<0.2` |
+| `archshell-claude-code/archshell-host.json` `protocol` | the core `ACTION_SCHEMA`, `archshell/action/v1` |
+| `docs/compatibility.md` | a row for the tag |
+
+Check a tag locally before pushing it (exit 1 lists every problem, naming the file):
+
+```sh
+uv run python scripts/release_check.py v0.1.0-rc.1
+```
+
+### One-time setup
+
+1. **TestPyPI Trusted Publishing.** On TestPyPI, under *Your projects → Publishing*, add a pending publisher for each of `archshell` and `archshell-dotnet`: owner `AntonioTamez`, repository `arch-shell`, workflow `release.yml`, environment `testpypi`. No API token is stored anywhere.
+2. **GitHub environment.** In the repository settings, create the environment `testpypi` (optionally restrict it to tags `v*`).
+3. **Signing key.** Register your GPG or SSH signing key on GitHub (*Settings → SSH and GPG keys*, as a signing key) and configure git to sign tags with it (`git config user.signingkey …`; for SSH also `git config gpg.format ssh`).
+4. **GitHub Packages.** Nothing to create: the first publish creates `Archshell.Analyzer`, linked to this repository through the csproj `RepositoryUrl`. Reading it needs a token with `read:packages`, even though the package is public.
+
+### Cut a signed pre-release
+
+1. On a branch, bump every version file above to the new pre-release, run `uv lock`, and add the tag's row to `docs/compatibility.md`. Run `uv run python scripts/release_check.py vX.Y.Z-rc.N`, merge to `main`.
+2. Tag the merged commit with a signed, annotated tag and push it:
+
+   ```sh
+   git tag -s v0.1.0-rc.1 -m "v0.1.0-rc.1"
+   git push origin v0.1.0-rc.1
+   ```
+
+3. The `release` workflow runs:
+   - `verify`: refuses a tag that is not a pre-release, is lightweight, or whose signature GitHub does not report as verified, then runs `scripts/release_check.py`;
+   - `ci`: the normal CI (`ci.yml`) on the tagged commit;
+   - `publish`: builds both wheels and sdists, packs the analyzer and pushes it to GitHub Packages with `GITHUB_TOKEN`, and only then uploads the Python distributions to TestPyPI through Trusted Publishing, last because that upload is permanent; only this job has write permissions;
+   - `install`: on Ubuntu, Windows, and macOS, a clean uv project installs `archshell` and `archshell-dotnet` pinned to TestPyPI (every other dependency from PyPI) and runs `archshell --version`, then installs `Archshell.Analyzer` from GitHub Packages with `dotnet tool install` and runs `archshell-analyzer`.
+
+A failed step publishes nothing after it: a failure in `verify`, `ci`, the build, or the pack publishes nothing at all, and a failed GitHub Packages push leaves TestPyPI untouched. Re-running `publish` is safe: the NuGet push skips a version already there, and `uv publish` skips files already uploaded. TestPyPI never accepts different files under a version it already holds, so to change a published release, cut the next `rc.N`.
+
+To install a published pre-release by hand, use the same project shape as the `install` job: TestPyPI as an `explicit = true` `[[tool.uv.index]]`, with `[tool.uv.sources]` pointing only `archshell` and `archshell-dotnet` at it.

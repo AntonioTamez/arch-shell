@@ -1,0 +1,224 @@
+name: release
+
+# Signed pre-release publishing (AD-22). A tag `vX.Y.Z-(alpha|beta|rc).N` whose
+# signature GitHub verified, and whose committed versions and compatibility
+# declarations agree (scripts/release_check.py), is built by the normal CI,
+# then published: `archshell` and `archshell-dotnet` to TestPyPI, and
+# `Archshell.Analyzer` to GitHub Packages. A clean job then installs both on
+# three OSes. Stable tags, PyPI, and nuget.org are out of scope.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: verify tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ github.ref_name }}
+      REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: tag shape (pre-release tags only)
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta|rc)\.[0-9]+$ ]]; then
+            echo "::error::tag $TAG refused: pre-release tags only (vX.Y.Z-(alpha|beta|rc).N)"
+            exit 1
+          fi
+
+      - name: signed, annotated tag (GitHub verification)
+        run: |
+          # A lightweight tag points at a commit, not a tag object; refuse it.
+          type="$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.type)"
+          if [ "$type" != "tag" ]; then
+            echo "::error::tag $TAG refused: not an annotated tag (object type: $type)"
+            exit 1
+          fi
+          sha="$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.sha)"
+          verified="$(gh api "repos/$REPO/git/tags/$sha" --jq .verification.verified)"
+          reason="$(gh api "repos/$REPO/git/tags/$sha" --jq .verification.reason)"
+          if [ "$verified" != "true" ]; then
+            echo "::error::tag $TAG refused: signature not verified by GitHub (reason: $reason)"
+            exit 1
+          fi
+          echo "tag $TAG: annotated, signature verified ($reason)"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: release check (versions and compatibility declarations)
+        run: python scripts/release_check.py "$TAG"
+
+  ci:
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    needs: [verify, ci]
+    runs-on: ubuntu-latest
+    # TestPyPI's trusted publisher is registered for this workflow and environment.
+    environment: testpypi
+    permissions:
+      contents: read
+      id-token: write   # TestPyPI Trusted Publishing (OIDC); no stored token
+      packages: write   # GitHub Packages (NuGet) with GITHUB_TOKEN
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: build Python distributions
+        run: uv build --all-packages --no-sources --out-dir dist
+
+      - name: pack analyzer
+        run: dotnet pack archshell-dotnet/analyzer --configuration Release --output nupkg
+
+      - name: publish analyzer to GitHub Packages
+        env:
+          OWNER: ${{ github.repository_owner }}
+          NUGET_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          dotnet nuget push "nupkg/*.nupkg"
+          --source "https://nuget.pkg.github.com/$OWNER/index.json"
+          --api-key "$NUGET_TOKEN"
+          --skip-duplicate
+
+      # Last: a TestPyPI upload is permanent, so it runs only after everything
+      # else in this job succeeded.
+      - name: publish to TestPyPI (Trusted Publishing)
+        run: >-
+          uv publish
+          --trusted-publishing always
+          --publish-url https://test.pypi.org/legacy/
+          --check-url https://test.pypi.org/simple/
+          dist/*
+
+  install:
+    name: clean install (${{ matrix.os }})
+    needs: [verify, publish]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: read   # GitHub Packages (NuGet) needs a token even to read
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAG: ${{ github.ref_name }}
+      OWNER: ${{ github.repository_owner }}
+    steps:
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: versions from the tag
+        run: |
+          [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-(alpha|beta|rc)\.([0-9]+)$ ]]
+          release="${BASH_REMATCH[1]}" label="${BASH_REMATCH[2]}" number="${BASH_REMATCH[3]}"
+          case "$label" in alpha) pre=a ;; beta) pre=b ;; rc) pre=rc ;; esac
+          echo "PY_VERSION=$release$pre$number" >> "$GITHUB_ENV"
+          echo "NUGET_VERSION=$release-$label.$number" >> "$GITHUB_ENV"
+
+      - name: install archshell and archshell-dotnet from TestPyPI
+        run: |
+          dir="$RUNNER_TEMP/archshell-install"
+          mkdir -p "$dir" && cd "$dir"
+          # Only our two packages come from TestPyPI (explicit index); every
+          # other dependency resolves from PyPI, so a squatted name on
+          # TestPyPI cannot be substituted.
+          cat > pyproject.toml <<EOF
+          [project]
+          name = "archshell-install-check"
+          version = "0.0.0"
+          requires-python = ">=3.12"
+          dependencies = ["archshell==$PY_VERSION", "archshell-dotnet==$PY_VERSION"]
+
+          [tool.uv]
+          package = false
+
+          [[tool.uv.index]]
+          name = "testpypi"
+          url = "https://test.pypi.org/simple/"
+          explicit = true
+
+          [tool.uv.sources]
+          archshell = { index = "testpypi" }
+          archshell-dotnet = { index = "testpypi" }
+          EOF
+          # TestPyPI's simple index can lag behind an upload.
+          for attempt in 1 2 3 4 5; do
+            uv sync --refresh && break
+            [ "$attempt" = 5 ] && exit 1
+            sleep 30
+          done
+
+      - name: archshell --version
+        run: |
+          cd "$RUNNER_TEMP/archshell-install"
+          out="$(uv run --no-sync archshell --version)"
+          echo "$out"
+          [ "$out" = "archshell $PY_VERSION" ]
+          uv run --no-sync python -c 'import sys, archshell_dotnet; assert archshell_dotnet.__version__ == sys.argv[1], archshell_dotnet.__version__' "$PY_VERSION"
+
+      - name: install Archshell.Analyzer from GitHub Packages
+        env:
+          GH_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          dir="$RUNNER_TEMP/analyzer-install"
+          mkdir -p "$dir" && cd "$dir"
+          # GitHub Packages is the only source; the token is read from the
+          # environment, never written to the file.
+          cat > nuget.config <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="github" value="https://nuget.pkg.github.com/$OWNER/index.json" />
+            </packageSources>
+            <packageSourceCredentials>
+              <github>
+                <add key="Username" value="$OWNER" />
+                <add key="ClearTextPassword" value="%GH_PACKAGES_TOKEN%" />
+              </github>
+            </packageSourceCredentials>
+          </configuration>
+          EOF
+          for attempt in 1 2 3 4 5; do
+            dotnet tool install Archshell.Analyzer --version "$NUGET_VERSION" --tool-path tools --configfile nuget.config && break
+            [ "$attempt" = 5 ] && exit 1
+            sleep 30
+          done
+
+      - name: archshell-analyzer
+        run: |
+          cd "$RUNNER_TEMP/analyzer-install"
+          out="$(./tools/archshell-analyzer)"
+          echo "$out"
+          [ "$out" = "archshell-analyzer $NUGET_VERSION" ]

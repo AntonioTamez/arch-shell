@@ -3,6 +3,8 @@ name: ci
 on:
   push:
   pull_request:
+  # The release workflow runs this same build on the tagged commit first.
+  workflow_call:
 
 permissions:
   contents: read

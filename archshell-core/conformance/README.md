@@ -11,6 +11,6 @@ CI runs the same command as its own step on Ubuntu, Windows, and macOS.
 | Module | Checks |
 | --- | --- |
 | `test_pack_conformance.py` | every installed `archshell.language_packs` entry point loads, declares `extension_contract = "archshell/language-pack-ext/v1"` and a non-blank `language`, and the core loader accepts the set (no duplicate language); the shipped `archshell-dotnet` pack declares `csharp` |
-| `test_plugin_conformance.py` | the Claude Code plugin, checked as files: the manifest, frontmatter of every command and agent, `run.md` covering all six action types and the protocol rules it must state, the plugin agent, the hook wiring in `hooks/hooks.json`, and the `ARCHSHELL_ENGINE` override on every engine call |
+| `test_plugin_conformance.py` | the Claude Code plugin, checked as files: the manifest, the host protocol declaration (`archshell-host.json` equals the core `ACTION_SCHEMA`), frontmatter of every command and agent, `run.md` covering all six action types and the protocol rules it must state, the plugin agent, the hook wiring in `hooks/hooks.json`, and the `ARCHSHELL_ENGINE` override on every engine call |
 
 Adding a check means adding a `test_*.py` file here. Golden and seeded-violation checks for packs arrive with the extensibility launch epic; the engine-interface (`human_ui`) run arrives with story 1.13.
