@@ -2,8 +2,10 @@
 
 Protocol messages are JSON over stdin/stdout, UTF-8, one message per
 invocation. stdout carries only the protocol; logs go to stderr as JSON lines.
-Usage: `archshell-engine <command> --feature <slug>`; the project root is the
-working directory. The hook sub-protocol (AD-17) is
+Usage: `archshell-engine next|submit --feature <slug> [--lang en|es]`; the
+project root is the working directory. `--lang` is the conversation language
+of every `message` the developer sees (default `en`); written files stay
+English. The hook sub-protocol (AD-17) is
 `archshell-engine guard-write|check-edit|on-stop [--feature <slug>] [--host <id>]`
 with an `archshell/hook/v1` message on stdin and an `archshell/verdict/v1`
 message on stdout (or the host's hook output with `--host`).
@@ -18,6 +20,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
+from archshell.adapters import catalogs
 from archshell.adapters.ids import fresh_ids
 from archshell.adapters.state_store import (
     CorruptState,
@@ -26,6 +29,8 @@ from archshell.adapters.state_store import (
     StateStore,
 )
 from archshell.domain import hooks, layout, workflow
+from archshell.domain.messages import DEFAULT_LANG, LANGUAGES, MessageError, msg
+from archshell.domain.messages import Message as Text
 from archshell.render.hosts import HOSTS, PayloadError
 
 ERROR_SCHEMA = "archshell/error/v1"
@@ -37,17 +42,33 @@ Message = dict[str, Any]
 
 
 class ProtocolError(Exception):
-    def __init__(self, code: str, message: str, details: dict[str, Any] | None = None):
-        super().__init__(message)
+    """A refusal; `message` is a catalog message, rendered when it is emitted."""
+
+    def __init__(
+        self, code: str, message: Text, details: dict[str, Any] | None = None,
+        lang: str | None = None,
+    ):
+        super().__init__(message.key)
         self.code = code
         self.message = message
         self.details = details or {}
+        # Set when raised after `--lang` was read but before `run()` knows it.
+        self.lang = lang
 
-    def to_message(self) -> Message:
+    def text(self, lang: str = DEFAULT_LANG) -> str:
+        """The rendered message; the bare key if the catalog itself is broken, so
+        an error (and a fail-closed hook block) is still emitted."""
+        try:
+            return catalogs.render(self.message, lang)
+        except (catalogs.CatalogError, MessageError) as exc:
+            log("catalog_error", key=self.message.key, error=str(exc))
+            return self.message.key
+
+    def to_message(self, lang: str = DEFAULT_LANG) -> Message:
         return {
             "schema": ERROR_SCHEMA,
             "code": self.code,
-            "message": self.message,
+            "message": self.text(lang),
             "details": self.details,
         }
 
@@ -58,10 +79,10 @@ def read_message(stream: BinaryIO) -> Message:
         message = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ProtocolError(
-            "invalid_message", f"stdin is not a UTF-8 JSON message: {exc}"
+            "invalid_message", msg("error.stdin_not_json", error=exc)
         ) from None
     if not isinstance(message, dict):
-        raise ProtocolError("invalid_message", "stdin message must be a JSON object")
+        raise ProtocolError("invalid_message", msg("error.stdin_not_object"))
     return message
 
 
@@ -69,21 +90,35 @@ def refuse(refusal: workflow.Refusal) -> ProtocolError:
     return ProtocolError(refusal.code, refusal.message, refusal.details)
 
 
-def parse_feature(args: Sequence[str]) -> str:
+def parse_arguments(args: Sequence[str]) -> tuple[str, str]:
+    """`--feature <slug> [--lang en|es]` -> (slug, lang).
+
+    Errors render in English, except those raised after a valid `--lang`."""
     if len(args) < 2 or args[0] != "--feature":
-        raise ProtocolError("invalid_feature", "expected --feature <slug>")
-    if len(args) > 2:
+        raise ProtocolError("invalid_feature", msg("error.expected_feature"))
+    rest = list(args[2:])
+    lang = DEFAULT_LANG
+    if rest and rest[0] == "--lang":
+        if len(rest) < 2 or rest[1] not in LANGUAGES:
+            raise ProtocolError(
+                "invalid_arguments",
+                msg("error.invalid_lang", languages=", ".join(LANGUAGES)),
+                {"arguments": rest[:2], "languages": list(LANGUAGES)},
+            )
+        lang, rest = rest[1], rest[2:]
+    if rest:
         raise ProtocolError(
-            "invalid_arguments", "unexpected arguments", {"arguments": list(args[2:])}
+            "invalid_arguments", msg("error.unexpected_arguments"), {"arguments": rest},
+            lang=lang,
         )
-    return validate_feature(args[1])
+    return args[1], lang
 
 
 def validate_feature(feature: str) -> str:
     if not workflow.is_valid_slug(feature):
         raise ProtocolError(
             "invalid_feature",
-            f"feature must be a kebab-case slug of at most {workflow.SLUG_MAX_LENGTH} characters",
+            msg("error.invalid_feature_slug", max_length=workflow.SLUG_MAX_LENGTH),
             {"feature": feature},
         )
     return feature
@@ -93,17 +128,19 @@ def require_flow(feature: str) -> None:
     if feature not in workflow.FLOWS:
         raise ProtocolError(
             "unknown_feature",
-            f"no workflow for feature: {feature}",
+            msg("error.unknown_feature", feature=feature),
             {"features": sorted(workflow.FLOWS)},
         )
 
 
-def cmd_next(feature: str, message: Message, store: StateStore) -> Message:
+def cmd_next(feature: str, message: Message, store: StateStore, lang: str) -> Message:
     del message  # `next` takes no input; everything comes from the state on disk.
     require_flow(feature)
     with store.locked(feature):
         state = store.read(feature)
-        outcome = workflow.on_next(state, feature, fresh_ids())
+        outcome = workflow.on_next(
+            state, feature, fresh_ids(), render=catalogs.render, lang=lang
+        )
         if isinstance(outcome, workflow.Refusal):
             raise refuse(outcome)
         store.ensure_prompt(outcome.state)
@@ -112,14 +149,14 @@ def cmd_next(feature: str, message: Message, store: StateStore) -> Message:
     return outcome.action.to_message()
 
 
-def cmd_submit(feature: str, message: Message, store: StateStore) -> Message:
+def cmd_submit(feature: str, message: Message, store: StateStore, lang: str) -> Message:
     submission = workflow.parse_submission(message)
     if isinstance(submission, workflow.Refusal):
         raise refuse(submission)
     if submission.feature != feature:
         raise ProtocolError(
             "invalid_feature",
-            "submit message feature does not match --feature",
+            msg("error.feature_mismatch"),
             {"feature": feature, "message_feature": submission.feature},
         )
     require_flow(feature)
@@ -131,7 +168,7 @@ def cmd_submit(feature: str, message: Message, store: StateStore) -> Message:
         config = load_config(store.root)
     except InvalidConfig as exc:
         raise ProtocolError(
-            "invalid_config", f"{layout.CONFIG} is invalid",
+            "invalid_config", msg("error.invalid_config", config=layout.CONFIG),
             {
                 "config": layout.CONFIG,
                 "errors": [{"path": p, "message": m} for p, m in workflow.cap_errors(exc.errors)],
@@ -147,7 +184,8 @@ def cmd_submit(feature: str, message: Message, store: StateStore) -> Message:
         state = store.read(feature)
         outcome = workflow.on_submit(
             state, submission, fresh_ids(),
-            validate=output_schemas.validate, max_retries=config.max_retries,
+            validate=output_schemas.validate, render=catalogs.render, lang=lang,
+            max_retries=config.max_retries,
         )
         if isinstance(outcome, workflow.Refusal):
             if outcome.code == "invalid_output":
@@ -170,7 +208,7 @@ def cmd_submit(feature: str, message: Message, store: StateStore) -> Message:
     return outcome.action.to_message()
 
 
-COMMANDS: dict[str, Callable[[str, Message, StateStore], Message]] = {
+COMMANDS: dict[str, Callable[[str, Message, StateStore, str], Message]] = {
     "next": cmd_next,
     "submit": cmd_submit,
 }
@@ -196,7 +234,7 @@ def parse_hook_options(command: str, args: Sequence[str]) -> dict[str, str]:
         if name not in allowed or name in options or index + 1 >= len(args):
             raise ProtocolError(
                 "invalid_arguments",
-                f"{command} takes only {', '.join(sorted(allowed))}, each once with a value",
+                msg("error.hook_arguments", command=command, options=", ".join(sorted(allowed))),
                 {"arguments": list(args)},
             )
         options[name] = args[index + 1]
@@ -206,7 +244,7 @@ def parse_hook_options(command: str, args: Sequence[str]) -> dict[str, str]:
     host = options.get("--host")
     if host is not None and host not in HOSTS:
         raise ProtocolError(
-            "unknown_host", f"unknown host: {host}", {"hosts": sorted(HOSTS)}
+            "unknown_host", msg("error.unknown_host", host=host), {"hosts": sorted(HOSTS)}
         )
     return options
 
@@ -231,7 +269,7 @@ def evaluate_hook(
 ) -> hooks.Verdict:
     hook = hooks.parse_hook(message, requires_path=command != "on-stop")
     if isinstance(hook, hooks.Invalid):
-        raise ProtocolError("invalid_message", hook.message)
+        raise ProtocolError("invalid_message", msg("error.hook_payload", error=hook.message))
     if command == "guard-write":
         return guard_write(hook, root)
     if command == "check-edit":
@@ -261,7 +299,7 @@ def run_hook(command: str, args: Sequence[str], stdin: BinaryIO, stdout: TextIO,
             try:
                 payload = host.parse_payload(command, payload)
             except PayloadError as exc:
-                raise ProtocolError("invalid_message", str(exc)) from None
+                raise ProtocolError("invalid_message", msg("error.hook_payload", error=exc)) from None
         verdict = evaluate_hook(command, payload, options.get("--feature"), root)
         result: Message = verdict.to_message()
     except Exception as exc:  # noqa: BLE001 - fail closed, never a traceback
@@ -269,14 +307,14 @@ def run_hook(command: str, args: Sequence[str], stdin: BinaryIO, stdout: TextIO,
             err = exc
             log("hook_error", command=command, code=err.code)
         else:
-            err = ProtocolError("internal_error", "unexpected engine failure")
+            err = ProtocolError("internal_error", msg("error.internal"))
             log("internal_error", command=command, error=repr(exc))
         if not fail_closed:
             if host is not None:
                 return EXIT_OK
             emit(err.to_message(), stdout)
             return EXIT_PROTOCOL_ERROR
-        result = hooks.error_block(err.code, err.message).to_message()
+        result = hooks.error_block(err.code, err.text()).to_message()
         result["error"] = err.to_message()
         exit_code = EXIT_PROTOCOL_ERROR
     if result["verdict"] == hooks.BLOCK:
@@ -290,8 +328,8 @@ def run_hook(command: str, args: Sequence[str], stdin: BinaryIO, stdout: TextIO,
         log("internal_error", command=command, error=repr(exc))
         if not fail_closed:
             return EXIT_OK
-        err = ProtocolError("internal_error", "host render failed")
-        result = hooks.error_block(err.code, err.message).to_message()
+        err = ProtocolError("internal_error", msg("error.host_render"))
+        result = hooks.error_block(err.code, err.text()).to_message()
         result["error"] = err.to_message()
         emit(result, stdout)
         return EXIT_PROTOCOL_ERROR
@@ -316,43 +354,45 @@ def run(
 ) -> int:
     if argv and argv[0] in HOOK_OPTIONS:
         return run_hook(argv[0], argv[1:], stdin, stdout, Path.cwd() if root is None else root)
+    lang = DEFAULT_LANG  # until `--lang` is parsed, errors render in English
     try:
         if not argv:
             raise ProtocolError(
-                "unknown_command", "no command given", {"commands": ALL_COMMANDS}
+                "unknown_command", msg("error.no_command"), {"commands": ALL_COMMANDS}
             )
         name = argv[0]
         handler = COMMANDS.get(name)
         if handler is None:
             raise ProtocolError(
                 "unknown_command",
-                f"unknown command: {name}",
+                msg("error.unknown_command", command=name),
                 {"commands": ALL_COMMANDS},
             )
-        feature = parse_feature(argv[1:])
+        feature, lang = parse_arguments(argv[1:])
+        validate_feature(feature)
         message = read_message(stdin)
         store = StateStore(Path.cwd() if root is None else root)
         try:
-            result = handler(feature, message, store)
+            result = handler(feature, message, store, lang)
         except LockHeld:
             raise ProtocolError(
-                "locked", "another engine invocation holds this feature's lock",
+                "locked", msg("error.locked"),
                 {"lock": layout.lock_file(feature)},
             ) from None
         except RevisionConflict as exc:
-            raise ProtocolError("stale_action", f"state changed concurrently: {exc}") from None
+            raise ProtocolError("stale_action", msg("error.state_conflict", error=exc)) from None
         except CorruptState:
             raise ProtocolError(
-                "invalid_state", "the feature's state file is unreadable",
+                "invalid_state", msg("error.invalid_state"),
                 {"state": layout.state_file(feature)},
             ) from None
     except ProtocolError as err:
         log("protocol_error", code=err.code)
-        emit(err.to_message(), stdout)
+        emit(err.to_message(err.lang or lang), stdout)
         return EXIT_PROTOCOL_ERROR
     except Exception as exc:  # noqa: BLE001 - never a traceback on stdout
         log("internal_error", error=repr(exc))
-        emit(ProtocolError("internal_error", "unexpected engine failure").to_message(), stdout)
+        emit(ProtocolError("internal_error", msg("error.internal")).to_message(lang), stdout)
         return EXIT_PROTOCOL_ERROR
     emit(result, stdout)
     return EXIT_OK

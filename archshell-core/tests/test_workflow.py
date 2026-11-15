@@ -6,8 +6,10 @@ import dataclasses
 
 import pytest
 
+from archshell.adapters.catalogs import render
 from archshell.adapters.output_schemas import validate
 from archshell.domain import workflow
+from archshell.domain.messages import LANGUAGES, Message
 from archshell.domain.actions import (
     ACTION_TYPES,
     ActionError,
@@ -41,11 +43,11 @@ def good(action) -> Submission:
 
 
 def submit(state, sub, fresh, **options):
-    return on_submit(state, sub, fresh, validate=validate, **options)
+    return on_submit(state, sub, fresh, validate=validate, render=render, **options)
 
 
 def start(feature: str = "probe") -> Outcome:
-    outcome = on_next(None, feature, ids(1))
+    outcome = on_next(None, feature, ids(1), render=render)
     assert isinstance(outcome, Outcome)
     return outcome
 
@@ -181,7 +183,9 @@ def test_probe_questions_carry_engine_header_and_options():
     for flow in workflow.FLOWS.values():
         for step in flow:
             if step.type in ("ask", "confirm"):
-                assert 0 < len(step.header) <= 12 and 2 <= len(step.options) <= 4
+                assert 2 <= len(step.options) <= 4
+                for lang in LANGUAGES:  # the header is a catalog key
+                    assert 0 < len(render(Message(step.header), lang)) <= 12
             else:
                 assert step.header == "" and step.options == ()
 
@@ -233,12 +237,12 @@ def test_transitions_are_deterministic():
 
 def test_next_with_state_returns_pending_unchanged():
     first = start()
-    again = on_next(first.state, "probe", ids(7))
+    again = on_next(first.state, "probe", ids(7), render=render)
     assert again == Outcome(first.state, first.action, changed=False)
 
 
 def test_next_unknown_feature():
-    refusal = on_next(None, "nope", ids(1))
+    refusal = on_next(None, "nope", ids(1), render=render)
     assert isinstance(refusal, Refusal) and refusal.code == "unknown_feature"
 
 
@@ -450,7 +454,7 @@ def test_zero_max_retries_refuses_at_once():
     first = start()
     refusal = submit(first.state, llm_sub(first, {}), ids(2), max_retries=0)
     assert isinstance(refusal, Refusal) and refusal.code == "invalid_output"
-    assert refusal.message == (
+    assert render(refusal.message, "en") == (
         "llm_task result does not match archshell/llm-text/v1 "
         "and the retry limit (0) is used up"
     )
@@ -459,7 +463,7 @@ def test_zero_max_retries_refuses_at_once():
 def test_errors_are_capped():
     many = [(f"$.f{i:02}" + "p" * 500, "m" * 500) for i in range(25)]
     first = start()
-    nxt = on_submit(first.state, llm_sub(first, {}), ids(2), validate=lambda s, r: many)
+    nxt = on_submit(first.state, llm_sub(first, {}), ids(2), validate=lambda s, r: many, render=render)
     assert isinstance(nxt, Outcome)
     assert len(nxt.state.errors) == workflow.MAX_REPORTED_ERRORS
     assert all(
@@ -478,7 +482,7 @@ def test_validator_runs_only_for_llm_task_steps():
     outcome = start()
     n = 2
     while not outcome.state.ended:
-        outcome = on_submit(outcome.state, good(outcome.action), ids(n), validate=spy)
+        outcome = on_submit(outcome.state, good(outcome.action), ids(n), validate=spy, render=render)
         n += 1
     assert calls == ["archshell/llm-text/v1"]
 
@@ -493,9 +497,16 @@ def test_state_round_trip_with_attempts():
 
 def test_state_without_attempts_reads_as_no_retry():
     data = start().state.to_dict()
-    del data["attempts"], data["errors"]
+    del data["attempts"], data["errors"], data["lang"]
     state = CursorState.from_dict(data)
-    assert (state.attempts, state.errors) == (0, ())
+    assert (state.attempts, state.errors, state.lang) == (0, (), "en")
+
+
+def test_state_with_lang_but_without_retry_fields_is_refused():
+    data = start().state.to_dict()
+    del data["attempts"], data["errors"]
+    with pytest.raises(StateError):
+        CursorState.from_dict(data)
 
 
 @pytest.mark.parametrize(

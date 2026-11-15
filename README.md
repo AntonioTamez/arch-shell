@@ -23,6 +23,7 @@ Requirements: [uv](https://docs.astral.sh/uv/), Python 3.12 or later, .NET SDK 1
 uv sync --locked
 uv run pytest
 echo '{}' | uv run archshell-engine next --feature probe   # first probe action: llm_task, revision 1
+echo '{}' | uv run archshell-engine next --feature probe --lang es   # same, texts in Spanish from the ask on
 uv run archshell --version
 dotnet build archshell-dotnet/analyzer
 dotnet run --project archshell-dotnet/analyzer
@@ -32,7 +33,7 @@ The engine speaks JSON over stdin/stdout, one message per invocation. stdout car
 
 ## Engine protocol (`archshell/action/v1`)
 
-The host loops: `archshell-engine next --feature <slug>`, execute the returned action, `archshell-engine submit --feature <slug>` with the result, until the action is `done` or `report`. `--feature <slug>` (kebab-case, at most 64 characters) is the only argument besides the command. The project root is the working directory. Every message carries `schema: archshell/<kind>/v1`.
+The host loops: `archshell-engine next --feature <slug>`, execute the returned action, `archshell-engine submit --feature <slug>` with the result, until the action is `done` or `report`. `--feature <slug>` (kebab-case, at most 64 characters) comes first, optionally followed by `--lang en|es` (see "Conversation language"); nothing else is accepted. The project root is the working directory. Every message carries `schema: archshell/<kind>/v1`.
 
 | Command | stdin | stdout |
 | --- | --- | --- |
@@ -122,13 +123,21 @@ No other keys are allowed. Records are **append-only**: `archshell.adapters.reco
 
 Until real feature workflows exist, two built-in flows exercise the action set: `probe` (`llm_task` → `ask` → `confirm` → `instruct_agent` → `done`) and `probe-report` (`llm_task` → `report`).
 
+### Conversation language
+
+`next` and `submit` take an optional `--lang en|es` (default `en`): the language of the developer's conversation, which only the host can see. The host passes `es` when the developer writes in Spanish and `en` otherwise (`archshell-claude-code/commands/run.md` says so); it never translates engine text itself. The engine renders every developer-facing text in that language: an `ask`/`confirm` `question`, `header`, and `options`, an `instruct_agent` `instruction`, a `report`/`done` `summary`, and the `message` of every error. Codes, `details`, every other field, and the one-message protocol do not change. An error raised before a valid `--lang` is read (an unknown command, a missing `--feature`, a bad `--lang`) is English; one raised after it (such as unexpected arguments after `--lang es`) is in that language.
+
+The text is rendered when an action is issued. A repeated `next` returns the pending action exactly as it was issued, whatever `--lang` it carries; a new language takes effect from the next action on. The state file holds the pending action in English plus the language it was issued in (`lang`; a state file without it reads as `en`).
+
+Texts live in per-language catalogs, `archshell-core/archshell/catalogs/en.yaml` and `es.yaml` (`schema: archshell/catalog/v1`, `lang`, and `messages`: a message key such as `flow.probe.ask.question` or `error.stale_action` mapped to a template with `{name}` placeholders; read as NFC). The domain names text only by key plus arguments; `archshell.adapters.catalogs` loads the files. Every catalog has the same keys with the same placeholders, and every key the code uses exists; `tests/test_messages.py` enforces both. Never localized: the `llm_task` prompt file and its retry text, the state file, records, config, logs, every other written file, and hook verdicts and hook errors (a hook gets no conversation language).
+
 Error codes (`archshell/error/v1`, exit code 2):
 
 | Code | Meaning |
 | --- | --- |
 | `unknown_command` | no command, or not `next`/`submit`/`guard-write`/`check-edit`/`on-stop` |
 | `invalid_feature` | `--feature` missing or not a valid slug, or the submit's `feature` differs from it |
-| `invalid_arguments` | arguments after `--feature <slug>`; for a hook command, an option it does not take, a repeated option, or an option without a value |
+| `invalid_arguments` | arguments after `--feature <slug>` other than one `--lang en\|es`, including `--lang` with no value or another language (`details` holds `arguments` and `languages`); for a hook command, an option it does not take, a repeated option, or an option without a value |
 | `unknown_host` | a hook command's `--host` names no known host renderer |
 | `invalid_message` | stdin is not a UTF-8 JSON object, the submit message is malformed, or a hook message (or, with `--host`, the host's hook payload) is not a valid `archshell/hook/v1` message, e.g. a missing or empty `path` |
 | `unknown_feature` | no workflow exists for this slug |
