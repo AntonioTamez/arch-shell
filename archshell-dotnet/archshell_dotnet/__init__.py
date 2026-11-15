@@ -12,6 +12,10 @@ try:
 except PackageNotFoundError:  # pragma: no cover - running from an uninstalled tree
     __version__ = "0.0.0"
 
+# The Archshell.Analyzer version this pack release runs (AD-22). The release
+# check requires it to equal the analyzer's csproj `<Version>`.
+ANALYZER_VERSION = "0.1.0-rc.1"
+
 
 class DotnetPack:
     """The .NET / C# language pack."""
@@ -22,4 +26,4 @@ class DotnetPack:
 
 PACK = DotnetPack()
 
-__all__ = ["PACK", "DotnetPack", "__version__"]
+__all__ = ["ANALYZER_VERSION", "PACK", "DotnetPack", "__version__"]

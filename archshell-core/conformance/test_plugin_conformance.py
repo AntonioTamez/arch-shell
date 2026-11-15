@@ -1,7 +1,7 @@
 """Claude Code plugin conformance (FR-37, AD-14).
 
 The host plugin holds no logic and has no Python, so it is checked as files:
-the manifest, well-formed frontmatter, `run.md` covering the whole closed
+the manifest, the host protocol declaration, well-formed frontmatter, `run.md` covering the whole closed
 action set and the protocol rules it must state, the plugin agent, the hook
 wiring, and the `ARCHSHELL_ENGINE` override on every engine call. The
 engine-interface run (AD-18 `human_ui`) arrives with story 1.13.
@@ -14,11 +14,12 @@ from pathlib import Path
 
 import pytest
 
-from archshell.domain.actions import ACTION_TYPES
+from archshell.domain.actions import ACTION_SCHEMA, ACTION_TYPES
 
 REPO = Path(__file__).resolve().parents[2]
 PLUGIN = REPO / "archshell-claude-code"
 MANIFEST = PLUGIN / ".claude-plugin" / "plugin.json"
+HOST_DECLARATION = PLUGIN / "archshell-host.json"
 COMMANDS = sorted((PLUGIN / "commands").glob("*.md"))
 AGENTS = sorted((PLUGIN / "agents").glob("*.md"))
 MARKDOWN = COMMANDS + AGENTS
@@ -54,6 +55,15 @@ def test_manifest_is_json_with_a_name():
     manifest = json.loads(text)
     assert isinstance(manifest["name"], str) and manifest["name"].strip()
     assert isinstance(manifest.get("description"), str) and manifest["description"].strip()
+
+
+def test_plugin_declares_the_core_action_protocol():
+    # The plugin speaks one protocol version (AD-22); it lives beside the
+    # manifest so `plugin.json` stays free of custom keys.
+    text = HOST_DECLARATION.read_bytes().decode("utf-8")
+    assert not text.startswith("\ufeff")
+    declaration = json.loads(text)
+    assert declaration == {"protocol": ACTION_SCHEMA}
 
 
 @pytest.mark.parametrize("path", MARKDOWN, ids=lambda p: p.name)

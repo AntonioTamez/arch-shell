@@ -1,6 +1,6 @@
 [project]
 name = "archshell"
-version = "0.1.0"
+version = "0.1.0rc1"
 description = "ArchShell core: domain, engine, and CLI."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -16,7 +16,5 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-root = ""
-# `schemas/` holds the core JSON Schemas, read at runtime; it ships as data
-# beside the `archshell` package (a namespace root with no `__init__.py`).
-module-name = ["archshell", "schemas"]
-namespace = true
+# The core JSON Schemas live in `archshell/schemas/` and ship inside the package.
+module-name = "archshell"

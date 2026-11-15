@@ -270,6 +270,6 @@ def test_read_unknown_feature_is_empty_and_bad_slug_refused(tmp_path):
 
 
 def test_schema_flows_match_the_vocabulary():
-    schema = json.loads((Path(records.__file__).parents[2] / "schemas" / "record-v1.json").read_text("utf-8"))
+    schema = json.loads((Path(records.__file__).parents[1] / "schemas" / "record-v1.json").read_text("utf-8"))
     assert tuple(schema["properties"]["flow"]["enum"]) == layout.RECORD_FLOWS
     assert schema["$id"] == layout.RECORD_SCHEMA

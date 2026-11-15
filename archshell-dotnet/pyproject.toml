@@ -1,10 +1,11 @@
 [project]
 name = "archshell-dotnet"
-version = "0.1.0"
+version = "0.1.0rc1"
 description = "ArchShell language pack for .NET / C#."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["archshell"]
+# The core range this pack supports (AD-22, docs/compatibility.md).
+dependencies = ["archshell>=0.1.0rc1,<0.2"]
 
 [project.entry-points."archshell.language_packs"]
 dotnet = "archshell_dotnet:PACK"

@@ -38,7 +38,7 @@ dev = [
 
 [[package]]
 name = "archshell"
-version = "0.1.0"
+version = "0.1.0rc1"
 source = { editable = "archshell-core" }
 dependencies = [
     { name = "jinja2" },
@@ -55,7 +55,7 @@ requires-dist = [
 
 [[package]]
 name = "archshell-dotnet"
-version = "0.1.0"
+version = "0.1.0rc1"
 source = { editable = "archshell-dotnet" }
 dependencies = [
     { name = "archshell" },
