@@ -7,7 +7,7 @@ ArchShell: an architecture shell that keeps an AI coding agent inside a confirme
 | Path | What it is |
 | --- | --- |
 | `pyproject.toml`, `uv.lock` | uv workspace root; one lockfile for all Python packages |
-| `archshell-core/` | distribution `archshell`: domain, render, ports, adapters, and the executables `archshell-engine` (host protocol) and `archshell` (human/CI commands) |
+| `archshell-core/` | distribution `archshell`: domain, render, ports, adapters, and the executables `archshell-engine` (host protocol) and `archshell` (human/CI commands); `conformance/` holds the extension conformance suite |
 | `archshell-dotnet/` | distribution `archshell-dotnet`: the .NET language pack (`archshell_dotnet/`) and the Roslyn analyzer (`analyzer/`, `net10.0` .NET tool) |
 | `archshell-claude-code/` | Claude Code host plugin; holds no logic and forwards to `archshell-engine` |
 | `.claude-plugin/marketplace.json` | local marketplace that lists the plugin |
@@ -22,6 +22,8 @@ Requirements: [uv](https://docs.astral.sh/uv/), Python 3.12 or later, .NET SDK 1
 ```sh
 uv sync --locked
 uv run pytest
+uv run python -c "import sys; from importlinter.cli import lint_imports; sys.exit(lint_imports(no_cache=True))"   # package boundaries (or: uv run lint-imports --no-cache)
+uv run python -m pytest archshell-core/conformance   # extension conformance suite
 echo '{}' | uv run archshell-engine next --feature probe   # first probe action: llm_task, revision 1
 echo '{}' | uv run archshell-engine next --feature probe --lang es   # same, texts in Spanish from the ask on
 uv run archshell --version
@@ -30,6 +32,54 @@ dotnet run --project archshell-dotnet/analyzer
 ```
 
 The engine speaks JSON over stdin/stdout, one message per invocation. stdout carries only the protocol; logs go to stderr as JSON lines. Errors are `archshell/error/v1` messages with exit code 2.
+
+## Boundaries and extensions
+
+### Package boundaries (AD-1, AD-4)
+
+[import-linter](https://import-linter.readthedocs.io/) (pinned in `uv.lock`, configured under `[tool.importlinter]` in the root `pyproject.toml`) enforces four contracts. CI runs them as their own step; a broken contract fails the build.
+
+| Contract | Rule |
+| --- | --- |
+| `core-never-imports-packs` | the core `archshell` never imports `archshell_dotnet` |
+| `core-layers` | `archshell.engine` and `archshell.cli` above `adapters`, above `render`, above `domain`; a lower layer never imports a higher one |
+| `inner-modules-stay-inner` | `domain`, `render`, and `ports` never import `adapters`, `engine`, or `cli` |
+| `domain-forbidden-imports` | `domain` never imports `render`, `ports`, `adapters`, `engine`, `cli`, `archshell_dotnet`, `jinja2`, `jsonschema`, or `yaml` (a forbidden list) |
+
+The stdlib-only rule (every domain import is the standard library or `archshell.domain`) is an allow-list enforced by `archshell-core/tests/test_boundaries.py` in the pytest step, not by import-linter. That file also proves that a core import of the pack, or a domain import of `yaml` or `archshell.adapters`, breaks the contracts (on a scratch copy). Where the `lint-imports` launcher is blocked (see below), run the contracts through Python:
+
+```sh
+uv run python -c "import sys; from importlinter.cli import lint_imports; sys.exit(lint_imports(no_cache=True))"
+```
+
+### Extension loading (AD-14, FR-36)
+
+Extensions are objects that distributions register under entry-point groups. `archshell.adapters.extensions.load(kind)` loads one group; `language_packs()` returns the packs keyed by language. No engine or CLI command calls the loader yet. There is no `archshell.hosts` group: host adapters (the Claude Code plugin) are files, not Python.
+
+| Kind | Entry-point group | `extension_contract` this core supports |
+| --- | --- | --- |
+| `language_packs` | `archshell.language_packs` | `archshell/language-pack-ext/v1` |
+| `providers` | `archshell.providers` | `archshell/provider-ext/v1` |
+| `ci` | `archshell.ci` | `archshell/ci-ext/v1` |
+
+Each loaded object must expose `extension_contract` equal to that version; a language pack must also expose a non-blank `language`. Refusals are typed errors that name the entry point and the distribution:
+
+| Code | Error | When |
+| --- | --- | --- |
+| `incompatible_extension` | `IncompatibleExtension` | `extension_contract` missing or another version, or a language pack without `language` |
+| `duplicate_language` | `DuplicateLanguage` | two language packs claim the same `language` (names both) |
+
+`archshell-dotnet` registers `dotnet = "archshell_dotnet:PACK"` in `archshell.language_packs`, with `language = "csharp"`.
+
+### Conformance suite (FR-37)
+
+`archshell-core/conformance/` is a pytest suite every extension must pass; CI runs it as its own step. It checks every installed language pack (loads through its entry point, declares the supported contract and its language) and the Claude Code plugin as files (manifest, `run.md` covering all six action types, the plugin agent, hook wiring, the `ARCHSHELL_ENGINE` override). Run it locally with:
+
+```sh
+uv run python -m pytest archshell-core/conformance
+```
+
+Adding a check means adding a `test_*.py` file there; see `archshell-core/conformance/README.md`.
 
 ## Engine protocol (`archshell/action/v1`)
 

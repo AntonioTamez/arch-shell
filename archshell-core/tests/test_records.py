@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from archshell.adapters import records as adapter_records
 from archshell.adapters.records import InvalidRecord, append_record, read_records
 from archshell.domain import layout, records
 
@@ -36,7 +37,7 @@ def files(root: Path) -> dict[str, bytes]:
 def test_first_record(tmp_path):
     record = write(tmp_path)
     assert record.path == ".archshell/records/cancel-appointment/0001-plan.yaml"
-    fingerprint = records.fingerprint(CONTENT)
+    fingerprint = adapter_records.fingerprint(CONTENT)
     assert (tmp_path / DIR / "0001-plan.yaml").read_bytes() == (
         "schema: archshell/record/v1\n"
         "feature: cancel-appointment\n"
@@ -245,15 +246,15 @@ def test_fallback_without_hard_links(tmp_path, monkeypatch):
 
 
 def test_fingerprint_given_must_match_content(tmp_path):
-    good = records.fingerprint(CONTENT)
+    good = adapter_records.fingerprint(CONTENT)
     assert write(tmp_path, fingerprint=good).document["fingerprint"] == good
     record = write(tmp_path, content=None, fingerprint=good, derived=True)
     assert "content" not in record.document and record.document["derived"] is True
 
 
 def test_fingerprint_is_of_canonical_bytes():
-    assert records.fingerprint({"b": 1, "a": "x"}) == records.fingerprint({"a": "x", "b": 1})
-    assert records.fingerprint("x") == "sha256:" + __import__("hashlib").sha256(b"x\n").hexdigest()
+    assert adapter_records.fingerprint({"b": 1, "a": "x"}) == adapter_records.fingerprint({"a": "x", "b": 1})
+    assert adapter_records.fingerprint("x") == "sha256:" + __import__("hashlib").sha256(b"x\n").hexdigest()
 
 
 def test_default_timestamp_is_utc_now(tmp_path):

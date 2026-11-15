@@ -39,6 +39,12 @@ jobs:
       - name: uv sync
         run: uv sync --locked
 
+      - name: lint imports (package boundaries, AD-1 / AD-4)
+        run: uv run lint-imports --no-cache
+
+      - name: conformance (Claude Code plugin, language packs)
+        run: uv run python -m pytest -v archshell-core/conformance
+
       - name: golden byte check (rendered sha256 must match the committed manifest)
         run: uv run pytest -v archshell-core/tests/test_golden.py
 

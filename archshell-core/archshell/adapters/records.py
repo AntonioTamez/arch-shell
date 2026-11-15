@@ -15,6 +15,7 @@ read; the schema library is imported on call.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
 from dataclasses import dataclass
@@ -27,7 +28,7 @@ from archshell.adapters.files import path_of
 from archshell.domain import layout, records
 from archshell.domain.workflow import is_valid_slug
 from archshell.render.normalize import to_bytes
-from archshell.render.yaml_emit import EmitError, emit
+from archshell.render.yaml_emit import EmitError, Ordered, emit
 
 
 class InvalidRecord(Exception):
@@ -43,6 +44,18 @@ class InvalidRecord(Exception):
         super().__init__(f"{file}: {detail}" if file else detail)
         self.errors = errors
         self.file = file
+
+
+def fingerprint(content: Any) -> str:
+    """`sha256:<hex>` of the canonical YAML bytes of `content`, equal on every OS.
+
+    Raises `archshell.render.yaml_emit.EmitError` for content outside the
+    restricted YAML subset.
+    """
+    return "sha256:" + hashlib.sha256(to_bytes(emit(content))).hexdigest()
+
+
+_content_fingerprint = fingerprint  # `append_record`'s `fingerprint` argument shadows it
 
 
 @dataclass(frozen=True)
@@ -72,12 +85,12 @@ def append_record(
         raise InvalidRecord([("$.feature", f"{feature!r} is not a valid feature slug")])
     if fingerprint is None and content is not None:
         try:
-            fingerprint = records.fingerprint(content)
+            fingerprint = _content_fingerprint(content)
         except EmitError as exc:
             raise InvalidRecord([("$.content", str(exc))]) from None
     elif fingerprint is not None and content is not None:
         try:
-            expected = records.fingerprint(content)
+            expected = _content_fingerprint(content)
         except EmitError as exc:
             raise InvalidRecord([("$.content", str(exc))]) from None
         if fingerprint != expected:
@@ -114,7 +127,7 @@ def append_record(
             _check(document)
             relative = records.record_path(feature, seq, flow)
             try:
-                _create_exclusive(path_of(root, relative), to_bytes(emit(document)), claims)
+                _create_exclusive(path_of(root, relative), to_bytes(emit(Ordered(document))), claims)
             except FileExistsError:
                 seq += 1
                 continue

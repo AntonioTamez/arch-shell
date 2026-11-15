@@ -3,21 +3,18 @@
 Pure: no IO, clock, or environment (AD-4). A record lives at
 `.archshell/records/<feature>/<seq>-<flow>.yaml`, `seq` zero-padded to four
 digits and counted per feature from `0001`. The adapter
-`archshell.adapters.records` writes and reads them; it validates documents
-against `archshell/record/v1`.
+`archshell.adapters.records` writes and reads them, computes content
+fingerprints, and validates documents against `archshell/record/v1`.
 """
 
 from __future__ import annotations
 
-import hashlib
 import re
 from datetime import UTC, datetime
 from typing import Any
 
 from archshell.domain import layout
 from archshell.domain.workflow import is_valid_slug
-from archshell.render.normalize import to_bytes
-from archshell.render.yaml_emit import Ordered, emit
 
 SEQ_WIDTH = 4
 MAX_SEQ = 10**SEQ_WIDTH - 1
@@ -56,15 +53,6 @@ def parse_filename(name: str) -> tuple[int, str] | None:
     return (seq, match.group(2)) if seq >= 1 else None
 
 
-def fingerprint(content: Any) -> str:
-    """`sha256:<hex>` of the canonical YAML bytes of `content`, equal on every OS.
-
-    Raises `archshell.render.yaml_emit.EmitError` for content outside the
-    restricted YAML subset.
-    """
-    return "sha256:" + hashlib.sha256(to_bytes(emit(content))).hexdigest()
-
-
 def format_timestamp(moment: datetime) -> str:
     """`moment` (timezone-aware) as UTC `YYYY-MM-DDTHH:MM:SSZ`."""
     if moment.tzinfo is None:
@@ -82,9 +70,12 @@ def build_record(
     confirmed_at: Any,
     derived: Any,
     content: Any = None,
-) -> Ordered:
-    """The record document in its canonical key order; `content` None is omitted."""
-    document = Ordered(
+) -> dict[str, Any]:
+    """The record document in its canonical key order; `content` None is omitted.
+
+    The adapter emits it with that key order kept.
+    """
+    document = dict(
         [
             ("schema", layout.RECORD_SCHEMA),
             ("feature", feature),
