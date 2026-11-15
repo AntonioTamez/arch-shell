@@ -76,7 +76,7 @@ Each loaded object must expose `extension_contract` equal to that version; a lan
 
 ### Conformance suite (FR-37)
 
-`archshell-core/conformance/` is a pytest suite every extension must pass; CI runs it as its own step. It checks every installed language pack (loads through its entry point, declares the supported contract and its language) and the Claude Code plugin as files (manifest, `run.md` covering all six action types, the plugin agent, hook wiring, the `ARCHSHELL_ENGINE` override). Run it locally with:
+`archshell-core/conformance/` is a pytest suite every extension must pass; CI runs it as its own step. It checks every installed language pack (loads through its entry point, declares the supported contract and its language) and the Claude Code plugin as files (manifest, `run.md` covering all six action types, the plugin agent, hook wiring, the `ARCHSHELL_ENGINE` override), plus an engine-interface (`human_ui`) run through the scripted no-op host (see "End-to-end no-op flow"). Run it locally with:
 
 ```sh
 uv run python -m pytest archshell-core/conformance
@@ -319,6 +319,17 @@ Try both built-in flows:
 ```
 
 Cursor state persists under `.archshell/` in the working directory, so a finished flow keeps returning its terminal action; delete `.archshell/state/<feature>.yaml` to run it again.
+
+### End-to-end no-op flow (no Claude Code, no model)
+
+`archshell-core/tests/test_no_op_flow.py` runs the whole platform contract at once, as the plugin would. A scripted host (`ScriptedHost` in `archshell-core/tests/conftest.py`) stands in for Claude Code and the model, built only from the plugin's own contract files: it answers each action the way `commands/run.md` says (the "user" picks the first option, the "agent" reads the prompt file and replies with one sentence) and runs the literal `hooks/hooks.json` command strings through bash, with `ARCHSHELL_ENGINE` set to `python -m archshell.engine`. The engine runs as a subprocess through its public CLI. Changing a `run.md` result shape or a hook command therefore breaks the run.
+
+One run covers `probe` then `probe-report` (all six action types; `done` and `report` both terminal), all three hooks (a protected write denied, ordinary writes allowed, `check-edit` and `on-stop` silent, and `guard-write` failing closed with exit 2 when the engine cannot start), stale and replayed submissions, an `llm_task` answered invalidly three times (retried twice, then `invalid_output`), and, after `done`, a `plan` confirmation record appended twice by the host and validated against `record-v1.json` (no engine command writes records yet). It runs in `en` and `es`: question and summary texts come from the `es` catalog, while every written file stays English, ASCII, LF-only, UTF-8 without BOM, and NFC. The id-independent output of the `es` run (prompt files, both records, the done and report summaries) is hashed against the `no-op/...` entries of `archshell-core/tests/golden/manifest.sha256`, so CI proves the same bytes on Ubuntu, Windows, and macOS. The same host gives the conformance suite its engine-interface (`human_ui`) run. Run it locally from the repository root (on Windows it needs Git Bash):
+
+```sh
+uv run python -m pytest -v archshell-core/tests/test_no_op_flow.py
+uv run python -m pytest -v archshell-core/conformance/test_plugin_conformance.py -k engine_interface
+```
 
 ### Hooks: see a protected write refused
 
