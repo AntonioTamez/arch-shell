@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 from conftest import Project as BaseProject
+from conftest import run_engine, tool_payload
 
 from archshell.adapters.state_store import LockHeld, StateStore
 from archshell.domain.workflow import FLOWS
@@ -525,3 +526,55 @@ def test_state_file_is_sorted_key_json_with_lf(project):
     assert b"\r" not in raw and raw.endswith(b"\n")
     state = json.loads(raw)
     assert raw.decode("utf-8") == json.dumps(state, sort_keys=True, indent=2) + "\n"
+
+
+# --- project root: nearest ancestor holding .archshell/ (retro R4) ----------
+
+
+def test_next_and_submit_from_a_subfolder_use_the_project_root(project):
+    first = assert_ok(*project.next())
+    deep = project.root / "src" / "deep"
+    deep.mkdir(parents=True)
+    assert assert_ok(*run_engine(deep, "next", "--feature", "probe")) == first
+    second = assert_ok(
+        *run_engine(
+            deep, "submit", "--feature", "probe",
+            stdin=json.dumps(submission_for(first)).encode("utf-8"),
+        )
+    )
+    assert second["revision"] == 2
+    assert json.loads(project.state_bytes())["revision"] == 2
+    assert not (project.root / "src" / ".archshell").exists()
+    assert not (deep / ".archshell").exists()
+
+
+def test_first_next_with_no_archshell_above_uses_the_cwd(tmp_path):
+    here = tmp_path / "fresh"
+    here.mkdir()
+    assert assert_ok(*run_engine(here, "next", "--feature", "probe"))["revision"] == 1
+    assert (here / ".archshell" / "state" / "probe.yaml").exists()
+
+
+def test_guard_write_uses_the_same_project_root(project):
+    assert_ok(*project.next())
+    sub = project.root / "sub"
+    sub.mkdir()
+    target = (project.root / ".archshell" / "state" / "probe.yaml").as_posix()
+    code, output = run_engine(
+        sub, "guard-write", "--host", "claude-code",
+        stdin=json.dumps(tool_payload(sub, "Write", target)).encode("utf-8"),
+    )
+    assert code == 0
+    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_root_walk_stops_at_a_repository_root(tmp_path):
+    # An .archshell/ in an unrelated outer folder is never adopted.
+    (tmp_path / ".archshell").mkdir()
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    work = repo / "src"
+    work.mkdir()
+    assert assert_ok(*run_engine(work, "next", "--feature", "probe"))["revision"] == 1
+    assert (work / ".archshell" / "state" / "probe.yaml").exists()
+    assert not (tmp_path / ".archshell" / "state").exists()
