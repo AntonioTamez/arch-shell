@@ -179,9 +179,11 @@ def test_invalid_llm_output_is_retried_twice_then_reported(tmp_path, lang):
     assert reply["details"]["output_schema"] == "archshell/llm-text/v1"
     assert reply["details"]["error_count"] >= 1
     assert state_bytes(host) == before
-    # Reported, not crashed: the last retry is still pending and a valid answer goes on.
-    assert host.next("probe") == retry2
-    assert [a["type"] for a in host.finish(retry2)] == PROBE_TYPES
+    # Reported, not crashed: a rerun's `next` restarts the step with fresh retries.
+    restarted = host.next("probe")
+    assert restarted["type"] == "llm_task" and restarted["revision"] == 4
+    assert "did not match" not in prompt_bytes(host, restarted).decode("utf-8")
+    assert [a["type"] for a in host.finish(restarted)] == PROBE_TYPES
 
 
 def test_record_written_twice_keeps_the_first_bytes(tmp_path, lang):

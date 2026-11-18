@@ -421,13 +421,21 @@ def on_next(
     *,
     render: Renderer,
     lang: str = DEFAULT_LANG,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> Outcome | Refusal:
     """Return the pending action, starting the feature's flow when there is no state.
 
     A pending action comes back exactly as it was issued, whatever `lang` this
-    call carries: a new language takes effect from the next action on.
+    call carries: a new language takes effect from the next action on. The one
+    exception is an `llm_task` that has used every retry (`attempts > 0` and
+    `attempts >= max_retries`): a new `next` is a rerun, so it re-issues the
+    step as a fresh first attempt with a new retry cycle.
     """
     if state is not None:
+        if state.attempts and state.attempts >= max_retries:
+            return issue(
+                state.flow, state.feature, state.step, state.revision + 1, ids, lang, render
+            )
         return Outcome(state, state.issued(render), changed=False)
     if feature not in FLOWS:
         return unknown_feature(feature)

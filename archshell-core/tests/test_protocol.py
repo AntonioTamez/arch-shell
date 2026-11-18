@@ -450,7 +450,79 @@ def test_retries_exhausted_is_invalid_output_and_state_unchanged(project):
         "errors": [{"path": "$.text", "message": "'' should be non-empty"}],
     }
     assert project.state_bytes() == before
-    assert assert_ok(*project.next()) == action
+    assert assert_ok(*project.next())["revision"] == action["revision"] + 1  # restarted
+
+
+def exhaust_retries(project) -> dict:
+    action = assert_ok(*project.next())
+    for _ in range(2):
+        action = assert_ok(*project.submit(invalid_submit(action)))
+    assert_refused(*project.submit(invalid_submit(action)), "invalid_output")
+    return action
+
+
+def test_next_after_exhausted_retries_restarts_them(project):
+    last = exhaust_retries(project)
+    fresh = assert_ok(*project.next())
+    assert fresh["type"] == "llm_task"
+    assert fresh["revision"] == last["revision"] + 1
+    assert fresh["action_id"] != last["action_id"]
+    assert project.prompt_path(fresh).read_bytes().decode("utf-8") == FLOWS["probe"][0].text
+    state = json.loads(project.state_bytes())
+    assert (state["step"], state["attempts"], state["errors"], state["action"]) == (0, 0, [], fresh)
+    # The restarted step is idempotent again and gets a full retry cycle.
+    assert assert_ok(*project.next()) == fresh
+    action = fresh
+    for _ in range(2):
+        action = assert_ok(*project.submit(invalid_submit(action)))
+        assert action["type"] == "llm_task"
+    assert_refused(*project.submit(invalid_submit(action)), "invalid_output")
+    assert_refused(*project.submit(invalid_submit(last)), "stale_action")
+
+
+def test_valid_output_after_a_restart_advances(project):
+    exhaust_retries(project)
+    fresh = assert_ok(*project.next())
+    ask = assert_ok(*project.submit(submission_for(fresh)))
+    assert ask["type"] == "ask"
+
+
+def test_next_with_max_retries_zero_keeps_the_pending_action(project):
+    project.root.joinpath(".archshell").mkdir()
+    project.root.joinpath(".archshell", "config.yaml").write_bytes(
+        b"schema: archshell/config/v1\nmax_retries: 0\n"
+    )
+    first = assert_ok(*project.next())
+    assert_refused(*project.submit(invalid_submit(first)), "invalid_output")
+    before = project.state_bytes()
+    assert assert_ok(*project.next()) == first
+    assert project.state_bytes() == before
+
+
+def test_next_restarts_an_unanswered_last_retry(project):
+    action = assert_ok(*project.next())
+    for _ in range(2):
+        action = assert_ok(*project.submit(invalid_submit(action)))
+    fresh = assert_ok(*project.next())
+    assert fresh["revision"] == action["revision"] + 1
+    assert_refused(*project.submit(submission_for(action)), "stale_action")
+    assert assert_ok(*project.submit(submission_for(fresh)))["type"] == "ask"
+
+
+def test_next_during_a_retry_cycle_refuses_an_invalid_config(project):
+    first = assert_ok(*project.next())
+    assert_ok(*project.submit(invalid_submit(first)))
+    project.root.joinpath(".archshell", "config.yaml").write_bytes(b"max_retries: nope\n")
+    before = project.state_bytes()
+    assert_refused(*project.next(), "invalid_config")
+    assert project.state_bytes() == before
+    assert project.lock_is_free()
+
+
+def test_next_ignores_an_invalid_config_when_no_retry_is_pending(project):
+    first = assert_ok(*project.next())
+    project.root.joinpath(".archshell", "config.yaml").write_bytes(b"max_retries: nope\n")
+    assert assert_ok(*project.next()) == first
 
 
 def test_valid_output_after_retry_advances(project):

@@ -3,7 +3,8 @@
 `create_layout` is explicit: only a caller that sets up a project runs it.
 Every other command keeps creating the directories it needs lazily.
 `load_config` imports the schema library on call, so commands that never read
-the config (`next`, the hooks) do not load it.
+the config (the hooks, and `next` unless a step's retries are in use) do not
+load it.
 """
 
 from __future__ import annotations

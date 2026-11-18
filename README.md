@@ -90,7 +90,7 @@ The host loops: `archshell-engine next --feature <slug>`, execute the returned a
 
 | Command | stdin | stdout |
 | --- | --- | --- |
-| `next` | `{}` | the pending action; on first call the flow starts at revision 1. Repeating `next` returns the same action and writes nothing. |
+| `next` | `{}` | the pending action; on first call the flow starts at revision 1. Repeating `next` returns the same action and writes nothing, except after an `llm_task`'s retries are used up, when it restarts the step (see output validation below). |
 | `submit` | an `archshell/submit/v1` message | the next action, revision +1 |
 
 Action fields (all types): `schema`, `type`, `feature`, `action_id`, `revision`, plus one text field per type:
@@ -114,7 +114,7 @@ A submit echoes `feature`, `action_id`, and `revision`, and carries `result` (an
 {"schema":"archshell/submit/v1","feature":"probe","action_id":"…","revision":2,"nonce":"…","source":"human_ui","result":{"answer":"yes"}}
 ```
 
-An `llm_task` result must match the core JSON Schema (draft 2020-12, `archshell-core/archshell/schemas/`) that its step names. Every `llm_task` today uses `archshell/llm-text/v1`: an object with exactly one property, `text`, a non-empty string, e.g. `{"text":"…"}`. The engine validates the result on `submit`, under the lock, after the `action_id`/`revision` checks. An invalid result re-issues the same step as a new `llm_task` (fresh `action_id`, `revision` +1, new `prompt_file`) whose prompt is the step's prompt followed by `Your previous answer did not match archshell/llm-text/v1:` and one `- <path>: <message>` line per schema error (path as a JSON path such as `$` or `$.text`). At most `max_retries` retries (default 2, set in `.archshell/config.yaml`) are issued per step; the next invalid result is refused with `invalid_output` and the state stays as it was, with the last retry still pending. The retry count is kept in the state file (`attempts`, with the errors that caused the latest retry in `errors`) and resets when the cursor advances. A stale submit is refused before validation and does not count. `ask`, `confirm`, and `instruct_agent` results are not schema-checked. The host never retries on its own: a retry is simply the next `llm_task` it receives.
+An `llm_task` result must match the core JSON Schema (draft 2020-12, `archshell-core/archshell/schemas/`) that its step names. Every `llm_task` today uses `archshell/llm-text/v1`: an object with exactly one property, `text`, a non-empty string, e.g. `{"text":"…"}`. The engine validates the result on `submit`, under the lock, after the `action_id`/`revision` checks. An invalid result re-issues the same step as a new `llm_task` (fresh `action_id`, `revision` +1, new `prompt_file`) whose prompt is the step's prompt followed by `Your previous answer did not match archshell/llm-text/v1:` and one `- <path>: <message>` line per schema error (path as a JSON path such as `$` or `$.text`). At most `max_retries` retries (default 2, set in `.archshell/config.yaml`) are issued per step; the next invalid result is refused with `invalid_output` and the state stays as it was, with the last retry still pending. A later `next` (a rerun) then restarts the step: it re-issues it as a fresh first attempt (new `action_id`, `revision` +1, the step's original prompt) with a new retry cycle. `next` reads `config.yaml` only when retries are in use; with `max_retries: 0` nothing is restarted and `next` keeps returning the pending action. The retry count is kept in the state file (`attempts`, with the errors that caused the latest retry in `errors`) and resets when the cursor advances. A stale submit is refused before validation and does not count. `ask`, `confirm`, and `instruct_agent` results are not schema-checked. The host never retries on its own: a retry is simply the next `llm_task` it receives.
 
 Every command works in the project root: the nearest folder at or above the working directory that holds `.archshell/`, never walking past a repository root (a folder holding `.git`); the working directory itself when none does. So `next`/`submit` run from a subfolder use the same state, and the hooks guard the same root. Cursor state lives at `.archshell/state/<slug>.yaml` (sorted-key JSON; gitignored once the layout's `.archshell/.gitignore` exists, see below). Every write is a revision compare-and-swap under an OS advisory lock on `.archshell/locks/<slug>.lock` (`flock` on POSIX, `msvcrt.locking` on Windows). The OS releases the lock once the holder's process has ended, even when it was killed (a command run in that brief moment can still be refused with `locked`), so a lock file left behind by a killed engine needs no cleanup. The file stays and holds the holder's pid, readable while the lock is held. A refused command never changes the state file.
 
@@ -143,7 +143,7 @@ max_retries: 2
 | `schema` | yes | `archshell/config/v1` |
 | `max_retries` | no (default 2) | integer 0–10: retries issued for an invalid `llm_task` result before `invalid_output` |
 
-No other keys are allowed. A missing `config.yaml` means the defaults. `submit` reads it on every call; an invalid one is refused with `invalid_config`.
+No other keys are allowed. A missing `config.yaml` means the defaults. `submit` reads it on every call, and `next` when a step's retries are in use; an invalid one is refused with `invalid_config`.
 
 ### Confirmation records (`archshell/record/v1`)
 
@@ -201,7 +201,7 @@ Error codes (`archshell/error/v1`, exit code 2):
 | `invalid_output` | an `llm_task` result still does not match its output schema after the retries; `details` holds `output_schema`, `error_count`, and `errors` (at most 10 `{path, message}` entries, paths and messages cut at 200 characters each) |
 | `locked` | another invocation holds the feature's lock |
 | `invalid_state` | the state file is unreadable |
-| `invalid_config` | `submit` found a `.archshell/config.yaml` that is not UTF-8, not restricted-subset YAML, or does not match `archshell/config/v1`; `details` holds `config` (the path) and `errors` (at most 10 `{path, message}` entries); the state is unchanged |
+| `invalid_config` | `submit` (or `next` during a retry cycle) found a `.archshell/config.yaml` that is not UTF-8, not restricted-subset YAML, or does not match `archshell/config/v1`; `details` holds `config` (the path) and `errors` (at most 10 `{path, message}` entries); the state is unchanged |
 | `internal_error` | unexpected engine failure |
 
 On Windows machines where Application Control (Smart App Control) blocks unsigned executables, the uv launchers (`pytest.exe`, `archshell-engine.exe`) and the analyzer build output cannot start. Use the module forms instead: `uv run python -m pytest`, `echo '{}' | uv run python -m archshell.engine next --feature probe`.
