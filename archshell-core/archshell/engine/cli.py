@@ -150,6 +150,8 @@ def cmd_next(feature: str, message: Message, store: StateStore, lang: str) -> Me
         store.ensure_prompt(outcome.state)
         if outcome.changed:
             store.write(outcome.state, expected_revision=0 if state is None else state.revision)
+            if state is not None:
+                store.discard_prompt(state, outcome.state)
     return outcome.action.to_message()
 
 
@@ -222,6 +224,7 @@ def cmd_submit(feature: str, message: Message, store: StateStore, lang: str) -> 
         assert state is not None  # on_submit refuses when there is no state
         store.ensure_prompt(outcome.state)
         store.write(outcome.state, expected_revision=state.revision)
+        store.discard_prompt(state, outcome.state)
     _log_submitted(feature, outcome.state)
     return outcome.action.to_message()
 

@@ -296,13 +296,6 @@ def test_repeat_next_restores_a_missing_prompt_file(project):
     assert project.state_bytes() == state
 
 
-def test_prompt_file_stays_while_later_actions_are_pending(project):
-    first = assert_ok(*project.next())
-    ask = assert_ok(*project.submit(submission_for(first)))
-    assert ask["type"] == "ask"
-    assert project.prompt_path(first).exists()
-
-
 def test_probe_report_llm_task_has_its_own_prompt_file(project):
     first = assert_ok(*project.next("probe-report"))
     assert project.prompt_path(first).read_bytes() == FLOWS["probe-report"][0].text.encode("utf-8")
@@ -650,3 +643,47 @@ def test_root_walk_stops_at_a_repository_root(tmp_path):
     assert assert_ok(*run_engine(work, "next", "--feature", "probe"))["revision"] == 1
     assert (work / ".archshell" / "state" / "probe.yaml").exists()
     assert not (tmp_path / ".archshell" / "state").exists()
+
+
+# --- prompt file cleanup -------------------------------------------------------
+
+
+def prompt_files(project) -> list[str]:
+    folder = project.root / ".archshell" / "state" / "prompts"
+    return sorted(f.name for f in folder.iterdir()) if folder.exists() else []
+
+
+def test_accepted_submit_deletes_the_answered_prompt(project):
+    first = assert_ok(*project.next())
+    assert project.prompt_path(first).exists()
+    assert_ok(*project.submit(submission_for(first)))
+    assert prompt_files(project) == []
+
+
+def test_retry_replaces_the_prompt_file(project):
+    first = assert_ok(*project.next())
+    retry = assert_ok(*project.submit(invalid_submit(first)))
+    assert prompt_files(project) == [retry["action_id"] + ".md"]
+    assert project.prompt_path(retry).read_bytes().decode("utf-8").startswith(
+        FLOWS["probe"][0].text + "\n\nYour previous answer did not match"
+    )
+
+
+def test_restart_after_exhausted_retries_replaces_the_prompt_file(project):
+    last = exhaust_retries(project)
+    fresh = assert_ok(*project.next())
+    assert fresh["action_id"] != last["action_id"]
+    assert prompt_files(project) == [fresh["action_id"] + ".md"]
+
+
+def test_refused_submit_keeps_the_pending_prompt(project):
+    first = assert_ok(*project.next())
+    assert_refused(*project.submit(submission_for(first, action_id="nope")), "stale_action")
+    assert prompt_files(project) == [first["action_id"] + ".md"]
+
+
+def test_a_full_flow_leaves_no_prompt_files(project):
+    action = assert_ok(*project.next())
+    while action["type"] != "done":
+        action = assert_ok(*project.submit(submission_for(action)))
+    assert prompt_files(project) == []

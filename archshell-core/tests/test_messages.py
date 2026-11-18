@@ -146,14 +146,16 @@ def test_spanish_report(engine):
 
 
 def test_spanish_run_writes_only_english_files(engine, capsys):
+    first = engine.next("probe", *ES_ARG)
+    prompt = engine.root.joinpath(*first["prompt_file"].split("/"))
+    assert prompt.read_bytes() == workflow.FLOWS["probe"][0].text.encode("utf-8")
     actions = engine.drive("probe", *ES_ARG)
     assert [a["type"] for a in actions] == [
         "llm_task", "ask", "confirm", "instruct_agent", "done"
     ]
     for action, english in zip(actions[1:], ENGLISH_PROBE[1:]):
         assert texts(action) != english  # the host saw Spanish
-    prompt = engine.root.joinpath(*actions[0]["prompt_file"].split("/"))
-    assert prompt.read_bytes() == workflow.FLOWS["probe"][0].text.encode("utf-8")
+    assert actions[0] == first
     state = json.loads((engine.root / ".archshell/state/probe.yaml").read_text("utf-8"))
     assert state["action"]["summary"] == ENGLISH_PROBE[-1]["summary"]
     written = engine.written_text()

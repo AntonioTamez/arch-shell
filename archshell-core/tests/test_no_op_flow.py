@@ -150,7 +150,8 @@ def test_stale_and_replayed_submissions_are_refused(tmp_path, lang):
     confirm = host.answer(ask)
     before = state_bytes(host)
     # An old revision, and the answered ask replayed with its used nonce.
-    assert_refused(*host.submit(host.submission(llm)), "stale_action")
+    # The answered llm_task's prompt file is gone, so the replay carries its own text.
+    assert_refused(*host.submit(host.submission(llm, result={"text": "ok"})), "stale_action")
     assert_refused(*host.submit(replay), "stale_action")
     assert_refused(*host.submit(host.submission(confirm, revision=ask["revision"])), "stale_action")
     # The current confirm with the ask's nonce, or without the human source.
@@ -223,8 +224,9 @@ def test_every_written_file_is_normalized(tmp_path, lang):
 def no_op_outputs(host: ScriptedHost, probe: list[dict], report: list[dict]) -> dict[str, bytes]:
     """The `es` run's output that does not depend on random ids or the clock."""
     return {
-        "no-op/es/prompt-probe.md": prompt_bytes(host, probe[0]),
-        "no-op/es/prompt-probe-report.md": prompt_bytes(host, report[0]),
+        # Prompt files are deleted once answered; the host saw them while pending.
+        "no-op/es/prompt-probe.md": host.written[probe[0]["prompt_file"]],
+        "no-op/es/prompt-probe-report.md": host.written[report[0]["prompt_file"]],
         **{
             f"no-op/es/{record.path.rsplit('/', 1)[1]}": host.written[record.path]
             for record in host.records

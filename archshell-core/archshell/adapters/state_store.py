@@ -115,6 +115,24 @@ class StateStore:
             pass
         _replace(path, data)
 
+    def discard_prompt(self, previous: CursorState, current: CursorState) -> None:
+        """Delete `previous`'s prompt file when `current` no longer points at it.
+
+        Call after `current` is written, while holding the lock. A failed delete
+        is ignored: the state is already committed, and the file is only left
+        behind.
+        """
+        old = previous.pending_prompt()
+        if old is None:
+            return
+        new = current.pending_prompt()
+        if new is not None and new.path == old.path:
+            return
+        try:
+            self.prompt_path(old).unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def lock_path(self, feature: str) -> Path:
         return path_of(self.root, layout.lock_file(feature))
 

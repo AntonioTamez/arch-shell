@@ -167,3 +167,26 @@ def test_state_for_another_feature_is_corrupt(tmp_path):
     path.write_bytes(serialize(first_state()))
     with pytest.raises(CorruptState):
         store.read("probe-report")
+
+
+def test_discard_prompt_deletes_only_a_replaced_prompt(tmp_path):
+    store = StateStore(tmp_path)
+    state = first_state()
+    with store.locked("probe"):
+        store.ensure_prompt(state)
+        path = store.prompt_path(state.pending_prompt())
+        store.discard_prompt(state, state)
+        assert path.exists()
+        store.discard_prompt(state, second_state(state))
+        assert not path.exists()
+        store.discard_prompt(state, second_state(state))  # already gone: no error
+
+
+def test_discard_prompt_failure_is_not_raised(tmp_path):
+    store = StateStore(tmp_path)
+    state = first_state()
+    path = store.prompt_path(state.pending_prompt())
+    path.mkdir(parents=True)  # unlink of a directory fails
+    with store.locked("probe"):
+        store.discard_prompt(state, second_state(state))
+    assert path.is_dir()
