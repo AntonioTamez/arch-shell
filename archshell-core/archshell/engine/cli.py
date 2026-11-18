@@ -137,8 +137,13 @@ def cmd_next(feature: str, message: Message, store: StateStore, lang: str) -> Me
     require_flow(feature)
     with store.locked(feature):
         state = store.read(feature)
+        # Only a state with retries in use needs `max_retries`; any other
+        # `next` never reads the config, so an invalid one cannot block it.
+        retries = {}
+        if state is not None and state.attempts:
+            retries["max_retries"] = _load_config_or_refuse(store.root).max_retries
         outcome = workflow.on_next(
-            state, feature, fresh_ids(), render=catalogs.render, lang=lang
+            state, feature, fresh_ids(), render=catalogs.render, lang=lang, **retries
         )
         if isinstance(outcome, workflow.Refusal):
             raise refuse(outcome)
@@ -151,7 +156,8 @@ def cmd_next(feature: str, message: Message, store: StateStore, lang: str) -> Me
 def _load_config_or_refuse(root: Path) -> Config:
     """The project config, or an `invalid_config` refusal.
 
-    `load_config` is imported here, like the other submit-only imports.
+    `load_config` is imported here, so a command that never reads the config
+    (the hooks, a `next` with no retries in use) does not load jsonschema.
     """
     from archshell.adapters.layout import InvalidConfig, load_config
 
