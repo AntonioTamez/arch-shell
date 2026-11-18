@@ -12,7 +12,7 @@ The engine command is the value of the `ARCHSHELL_ENGINE` environment variable w
 
 Every call carries `--lang <lang>`, the conversation language: `es` when the developer writes to you in Spanish, `en` otherwise. Use only `en` or `es`, and decide it from the developer's latest message before each call. The engine renders every question, option, instruction, summary, and error `message` in that language; never translate engine text yourself, in either direction.
 
-Every message goes to the engine on stdin through a quoted heredoc, never as a command-line argument. Run each call with the Bash tool from the project root, exactly in this form:
+Every message goes to the engine on stdin through a quoted heredoc, never as a command-line argument. Run each call with the Bash tool, exactly in this form. You may run it from the project root or any folder inside it: the engine always works in the project root, the nearest folder at or above the working directory that holds `.archshell/`, never walking past a repository root (a folder holding `.git`); the working directory itself when none does.
 
 ```sh
 ${ARCHSHELL_ENGINE:-archshell-engine} next --feature '<slug>' --lang <lang> 2>>"${TMPDIR:-/tmp}/archshell-engine.log" <<'ARCHSHELL_MESSAGE'
@@ -58,7 +58,7 @@ For `ask` and `confirm` add two fields: `"nonce":"<the action's nonce>"` and `"s
 
 The action has `prompt_file`: a POSIX path, relative to the project root, of a file the engine wrote. Do not read that file yourself and do not put its content anywhere.
 
-1. Build the prompt file's absolute path: the project root (the absolute directory you run the engine calls from) joined with `prompt_file`, in the platform's native path form.
+1. Build the prompt file's absolute path: the project root (the nearest folder at or above your working directory that holds `.archshell/`, which holds the prompt file) joined with `prompt_file`, in the platform's native path form.
 2. Launch the Agent tool with `subagent_type` `archshell:archshell-task`, `description` `ArchShell llm_task`, and as `prompt` that absolute path and nothing else. Launch a new agent for every `llm_task`; never reuse or resume one.
 3. If the agent's reply starts with `ARCHSHELL_PROMPT_UNREADABLE`, stop, submit nothing, and show the user that reply verbatim.
 4. Otherwise submit with `result` `{"text": <the agent's reply, verbatim>}`.

@@ -385,11 +385,29 @@ def emit(message: Message, stdout: TextIO) -> None:
     stdout.flush()
 
 
+def project_root(start: Path) -> Path:
+    """The nearest folder at or above `start` that holds `.archshell/`, else `start`.
+
+    The walk stops at a repository root (a folder holding `.git`), so a project
+    never attaches to an `.archshell/` in an unrelated outer folder. Every
+    command uses it, so the hooks guard the same root that `next` and `submit`
+    write in, whatever folder the host runs them from.
+    """
+    for folder in (start, *start.parents):
+        if (folder / layout.ROOT).is_dir():
+            return folder
+        if (folder / ".git").exists():
+            break
+    return start
+
+
 def run(
     argv: Sequence[str], stdin: BinaryIO, stdout: TextIO, root: Path | None = None
 ) -> int:
+    if root is None:
+        root = project_root(Path.cwd())
     if argv and argv[0] in HOOK_OPTIONS:
-        return run_hook(argv[0], argv[1:], stdin, stdout, Path.cwd() if root is None else root)
+        return run_hook(argv[0], argv[1:], stdin, stdout, root)
     lang = DEFAULT_LANG  # until `--lang` is parsed, errors render in English
     try:
         if not argv:
@@ -407,7 +425,7 @@ def run(
         feature, lang = parse_arguments(argv[1:])
         validate_feature(feature)
         message = read_message(stdin)
-        store = StateStore(Path.cwd() if root is None else root)
+        store = StateStore(root)
         try:
             result = handler(feature, message, store, lang)
         except LockHeld:

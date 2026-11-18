@@ -86,7 +86,7 @@ Adding a check means adding a `test_*.py` file there; see `archshell-core/confor
 
 ## Engine protocol (`archshell/action/v1`)
 
-The host loops: `archshell-engine next --feature <slug>`, execute the returned action, `archshell-engine submit --feature <slug>` with the result, until the action is `done` or `report`. `--feature <slug>` (kebab-case, at most 64 characters) comes first, optionally followed by `--lang en|es` (see "Conversation language"); nothing else is accepted. The project root is the working directory. Every message carries `schema: archshell/<kind>/v1`.
+The host loops: `archshell-engine next --feature <slug>`, execute the returned action, `archshell-engine submit --feature <slug>` with the result, until the action is `done` or `report`. `--feature <slug>` (kebab-case, at most 64 characters) comes first, optionally followed by `--lang en|es` (see "Conversation language"); nothing else is accepted. The project root is the nearest folder at or above the working directory that holds `.archshell/`, never walking past a repository root (a folder holding `.git`); the working directory itself when none does (see cursor state below). Every message carries `schema: archshell/<kind>/v1`.
 
 | Command | stdin | stdout |
 | --- | --- | --- |
@@ -116,7 +116,7 @@ A submit echoes `feature`, `action_id`, and `revision`, and carries `result` (an
 
 An `llm_task` result must match the core JSON Schema (draft 2020-12, `archshell-core/archshell/schemas/`) that its step names. Every `llm_task` today uses `archshell/llm-text/v1`: an object with exactly one property, `text`, a non-empty string, e.g. `{"text":"…"}`. The engine validates the result on `submit`, under the lock, after the `action_id`/`revision` checks. An invalid result re-issues the same step as a new `llm_task` (fresh `action_id`, `revision` +1, new `prompt_file`) whose prompt is the step's prompt followed by `Your previous answer did not match archshell/llm-text/v1:` and one `- <path>: <message>` line per schema error (path as a JSON path such as `$` or `$.text`). At most `max_retries` retries (default 2, set in `.archshell/config.yaml`) are issued per step; the next invalid result is refused with `invalid_output` and the state stays as it was, with the last retry still pending. The retry count is kept in the state file (`attempts`, with the errors that caused the latest retry in `errors`) and resets when the cursor advances. A stale submit is refused before validation and does not count. `ask`, `confirm`, and `instruct_agent` results are not schema-checked. The host never retries on its own: a retry is simply the next `llm_task` it receives.
 
-Cursor state lives at `.archshell/state/<slug>.yaml` (sorted-key JSON; gitignored once the layout's `.archshell/.gitignore` exists, see below). Every write is a revision compare-and-swap under an OS advisory lock on `.archshell/locks/<slug>.lock` (`flock` on POSIX, `msvcrt.locking` on Windows). The OS releases the lock once the holder's process has ended, even when it was killed (a command run in that brief moment can still be refused with `locked`), so a lock file left behind by a killed engine needs no cleanup. The file stays and holds the holder's pid, readable while the lock is held. A refused command never changes the state file.
+Every command works in the project root: the nearest folder at or above the working directory that holds `.archshell/`, never walking past a repository root (a folder holding `.git`); the working directory itself when none does. So `next`/`submit` run from a subfolder use the same state, and the hooks guard the same root. Cursor state lives at `.archshell/state/<slug>.yaml` (sorted-key JSON; gitignored once the layout's `.archshell/.gitignore` exists, see below). Every write is a revision compare-and-swap under an OS advisory lock on `.archshell/locks/<slug>.lock` (`flock` on POSIX, `msvcrt.locking` on Windows). The OS releases the lock once the holder's process has ended, even when it was killed (a command run in that brief moment can still be refused with `locked`), so a lock file left behind by a killed engine needs no cleanup. The file stays and holds the holder's pid, readable while the lock is held. A refused command never changes the state file.
 
 ### `.archshell/` layout (AD-10)
 
@@ -222,7 +222,7 @@ The verdict is one line on stdout, exit code 0:
 {"schema":"archshell/verdict/v1","verdict":"block","code":"protected_path","reason":"ArchShell: .archshell/x is engine-owned. …"}
 ```
 
-`verdict` is `allow` or `block`; `code` is `allowed` for an allow; `reason` is the text shown to the agent. Paths are resolved against `cwd` (default: the project root, which is the working directory), `.` and `..` are collapsed, Win32 device prefixes are stripped, trailing dots and spaces in names are ignored, `\` counts as a separator, and the result is compared with the project root case-insensitively. A drive-relative path such as `C:x` cannot be resolved and is blocked (`unresolvable_path`). The check runs twice, once lexically and once with symlinks resolved (`realpath`) for both root and path; either block wins. A path outside the project root is allowed.
+`verdict` is `allow` or `block`; `code` is `allowed` for an allow; `reason` is the text shown to the agent. Paths are resolved against `cwd` (default: the project root), `.` and `..` are collapsed, Win32 device prefixes are stripped, trailing dots and spaces in names are ignored, `\` counts as a separator, and the result is compared with the project root case-insensitively. A drive-relative path such as `C:x` cannot be resolved and is blocked (`unresolvable_path`). The check runs twice, once lexically and once with symlinks resolved (`realpath`) for both root and path; either block wins. A path outside the project root is allowed.
 
 **Fail-closed rule:** `guard-write` never fails open. Bad arguments, an unknown host, a non-JSON or malformed message, or any unexpected engine error yields a `block` verdict whose `code` is the error code (`invalid_arguments`, `unknown_host`, `invalid_message`, `internal_error`, …) with the `archshell/error/v1` message in `error`, exit code 2. `check-edit` and `on-stop` errors are plain `archshell/error/v1` messages, exit code 2.
 
@@ -281,7 +281,7 @@ Then, in Claude Code:
 /plugin install archshell@arch-shell
 ```
 
-Restart Claude Code if asked, then run `/archshell:ping`. It shows the first action of the `probe` flow (`llm_task`). It writes cursor state under `.archshell/` in the working directory, so repeated pings show the same action.
+Restart Claude Code if asked, then run `/archshell:ping`. It shows the first action of the `probe` flow (`llm_task`). It writes cursor state under `.archshell/` in the project root, so repeated pings show the same action.
 
 ### Override the engine command
 
@@ -318,7 +318,7 @@ Try both built-in flows:
 /archshell:run probe-report   # agent task, then the report summary
 ```
 
-Cursor state persists under `.archshell/` in the working directory, so a finished flow keeps returning its terminal action; delete `.archshell/state/<feature>.yaml` to run it again.
+Cursor state persists under `.archshell/` in the project root, so a finished flow keeps returning its terminal action; delete `.archshell/state/<feature>.yaml` to run it again.
 
 ### End-to-end no-op flow (no Claude Code, no model)
 
