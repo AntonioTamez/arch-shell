@@ -1,23 +1,62 @@
 """Cursor state on disk: per-feature lock file and revision compare-and-swap.
 
 State lives at `<root>/.archshell/state/<slug>.yaml`, serialized as sorted-key
-JSON (a YAML subset); moving it to canonical YAML is deferred. The lock is
-`<root>/.archshell/locks/<slug>.lock`, taken by exclusive create. The prompt
+JSON (a YAML subset); moving it to canonical YAML is deferred. The lock is an
+OS advisory lock on `<root>/.archshell/locks/<slug>.lock` (`flock` on POSIX,
+`msvcrt.locking` on Windows), so the OS releases it when the holder exits or
+is killed; the file itself stays and holds the last holder's pid. The prompt
 of a pending `llm_task` lives beside the state, at the project-relative path
 the action names (`.archshell/state/prompts/<action_id>.md`).
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from archshell.adapters.files import open_exclusive, path_of
+from archshell.adapters.files import path_of
 from archshell.domain import layout
 from archshell.domain.workflow import CursorState, PromptFile, StateError
+
+
+if os.name == "nt":
+    import msvcrt
+
+    _HELD_ERRNOS = {errno.EACCES, getattr(errno, "EDEADLOCK", errno.EDEADLK)}
+    # Windows byte-range locks are mandatory: lock one byte far past the pid
+    # (locking beyond end of file is allowed) so the pid stays readable.
+    _LOCK_OFFSET = 1 << 30
+
+    def _try_lock(fd: int) -> bool:
+        os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            if exc.errno in _HELD_ERRNOS:
+                return False
+            raise
+        return True
+
+    def _unlock(fd: int) -> None:
+        os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl
+
+    def _try_lock(fd: int) -> bool:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+    def _unlock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 class LockHeld(Exception):
@@ -81,20 +120,27 @@ class StateStore:
 
     @contextmanager
     def locked(self, feature: str) -> Iterator[None]:
+        """Hold the feature's lock, or raise `LockHeld` when another holder has it.
+
+        The file is never unlinked: unlinking a locked file would let a second
+        process lock a new file at the same path while the first still holds the
+        old one. A file left with no OS lock on it is free.
+        """
         path = self.lock_path(feature)
         path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o777)
         try:
-            fd = open_exclusive(path, mode=0o777)  # os.open's default, as before
-        except FileExistsError:
-            raise LockHeld(str(path)) from None
-        try:
+            if not _try_lock(fd):
+                raise LockHeld(str(path))
             try:
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
                 os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+                yield
             finally:
-                os.close(fd)
-            yield
+                _unlock(fd)
         finally:
-            path.unlink(missing_ok=True)
+            os.close(fd)
 
     def read(self, feature: str) -> CursorState | None:
         path = self.state_path(feature)

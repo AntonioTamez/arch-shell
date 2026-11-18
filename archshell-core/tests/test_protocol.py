@@ -8,11 +8,13 @@ bytes (unchanged on every refusal).
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 from conftest import Project as BaseProject
 
+from archshell.adapters.state_store import LockHeld, StateStore
 from archshell.domain.workflow import FLOWS
 
 
@@ -25,6 +27,13 @@ class Project(BaseProject):
 
     def lock_path(self, feature: str = "probe") -> Path:
         return self.root / ".archshell" / "locks" / f"{feature}.lock"
+
+    def lock_is_free(self, feature: str = "probe") -> bool:
+        try:
+            with StateStore(self.root).locked(feature):
+                return True
+        except LockHeld:
+            return False
 
     def state_bytes(self, feature: str = "probe") -> bytes | None:
         path = self.state_path(feature)
@@ -94,7 +103,7 @@ def test_first_next_issues_first_action_and_writes_state(project):
     assert state["schema"] == "archshell/state/v1"
     assert state["revision"] == 1
     assert state["action"] == action
-    assert not project.lock_path().exists()
+    assert project.lock_is_free()
 
 
 def test_repeat_next_returns_same_action_without_writing(project):
@@ -202,21 +211,32 @@ def test_submit_after_done_is_refused(project):
 def test_held_lock_is_refused(project, command):
     first = assert_ok(*project.next())
     before = project.state_bytes()
-    project.lock_path().write_bytes(b"12345\n")
-    if command == "next":
-        result = project.next()
-    else:
-        result = project.submit(submission_for(first))
+    with StateStore(project.root).locked("probe"):
+        if command == "next":
+            result = project.next()
+        else:
+            result = project.submit(submission_for(first))
     assert_refused(*result, "locked")
     assert project.state_bytes() == before
-    assert project.lock_path().read_bytes() == b"12345\n"
+    assert project.lock_path().read_bytes() == f"{os.getpid()}\n".encode("ascii")
 
 
 def test_held_lock_on_first_next_writes_no_state(project):
-    project.lock_path().parent.mkdir(parents=True)
-    project.lock_path().write_bytes(b"")
-    assert_refused(*project.next(), "locked")
+    with StateStore(project.root).locked("probe"):
+        result = project.next()
+    assert_refused(*result, "locked")
     assert project.state_bytes() is None
+
+
+@pytest.mark.parametrize("command", ["next", "submit"])
+def test_lock_file_left_by_a_killed_engine_is_recovered(project, command):
+    first = assert_ok(*project.next())
+    project.lock_path().write_bytes(b"12345\n")
+    if command == "next":
+        assert assert_ok(*project.next()) == first
+    else:
+        assert assert_ok(*project.submit(submission_for(first)))["revision"] == 2
+    assert project.lock_is_free()
 
 
 @pytest.mark.parametrize("command", ["next", "submit"])
@@ -377,7 +397,7 @@ def test_corrupt_state_is_invalid_state(project):
     project.state_path().write_bytes(b"{not json")
     assert_refused(*project.next(), "invalid_state")
     assert project.state_bytes() == b"{not json"
-    assert not project.lock_path().exists()
+    assert project.lock_is_free()
 
 
 # --- llm_task output validation (story 1.5) ----------------------------------

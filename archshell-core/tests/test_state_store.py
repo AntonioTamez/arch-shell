@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import errno
+import os
+import subprocess
+import sys
+import time
+
 import pytest
 
 from archshell.adapters.catalogs import render
@@ -39,7 +45,7 @@ def test_write_and_read_round_trip(tmp_path):
         store.write(state, expected_revision=0)
     assert store.read("probe") == state
     assert store.state_path("probe").read_bytes() == serialize(state)
-    assert not store.lock_path("probe").exists()
+    assert lock_is_free(store)
 
 
 def test_compare_and_swap_rejects_wrong_expected_revision(tmp_path):
@@ -57,6 +63,14 @@ def test_compare_and_swap_rejects_wrong_expected_revision(tmp_path):
     assert store.read("probe").revision == 2
 
 
+def lock_is_free(store, feature="probe"):
+    try:
+        with store.locked(feature):
+            return True
+    except LockHeld:
+        return False
+
+
 def test_lock_is_exclusive_and_released(tmp_path):
     store = StateStore(tmp_path)
     with store.locked("probe"):
@@ -64,8 +78,7 @@ def test_lock_is_exclusive_and_released(tmp_path):
         with pytest.raises(LockHeld):
             with store.locked("probe"):
                 pass
-        assert store.lock_path("probe").exists()
-    assert not store.lock_path("probe").exists()
+    assert lock_is_free(store)
 
 
 def test_lock_released_on_error(tmp_path):
@@ -73,7 +86,69 @@ def test_lock_released_on_error(tmp_path):
     with pytest.raises(RuntimeError):
         with store.locked("probe"):
             raise RuntimeError
-    assert not store.lock_path("probe").exists()
+    assert lock_is_free(store)
+
+
+def test_lock_file_left_without_a_holder_is_free(tmp_path):
+    # A killed engine, or an older engine version, left the file behind.
+    store = StateStore(tmp_path)
+    path = store.lock_path("probe")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"12345\n")
+    with store.locked("probe"):
+        pass
+    assert path.read_bytes() == f"{os.getpid()}\n".encode("ascii")
+
+
+def test_lock_of_a_killed_holder_is_recovered(tmp_path):
+    store = StateStore(tmp_path)
+    holder = subprocess.Popen(
+        [
+            sys.executable, "-c",
+            "import os, sys, time\n"
+            "from pathlib import Path\n"
+            "from archshell.adapters.state_store import StateStore\n"
+            "with StateStore(Path(sys.argv[1])).locked('probe'):\n"
+            "    print('held', os.getpid(), flush=True)\n"
+            "    time.sleep(60)\n",
+            str(tmp_path),
+        ],
+        stdout=subprocess.PIPE,
+    )
+    try:
+        word, pid = holder.stdout.readline().split()
+        assert word == b"held"
+        assert not lock_is_free(store)
+        # The pid is readable while the lock is held (Windows locks are mandatory).
+        assert store.lock_path("probe").read_bytes() == pid + b"\n"
+    finally:
+        holder.kill()
+        holder.wait()
+        holder.stdout.close()
+    assert store.lock_path("probe").exists()
+    # The OS frees a dead process's locks soon after exit, not necessarily at once.
+    deadline = time.monotonic() + 5
+    while not lock_is_free(store):
+        assert time.monotonic() < deadline, "lock of a killed holder was never released"
+        time.sleep(0.05)
+
+
+def test_lock_os_error_is_raised_not_lock_held(tmp_path, monkeypatch):
+    from archshell.adapters import state_store
+
+    def broken(*args):
+        raise OSError(errno.EIO, "I/O error")
+
+    if os.name == "nt":
+        monkeypatch.setattr(state_store.msvcrt, "locking", broken)
+    else:
+        monkeypatch.setattr(state_store.fcntl, "flock", broken)
+    store = StateStore(tmp_path)
+    with pytest.raises(OSError) as raised:
+        with store.locked("probe"):
+            pass
+    assert not isinstance(raised.value, LockHeld)
+    assert raised.value.errno == errno.EIO
 
 
 @pytest.mark.parametrize("raw", [b"{", b"\xff", b"[]", b'{"schema":"archshell/state/v1"}'])
@@ -92,34 +167,3 @@ def test_state_for_another_feature_is_corrupt(tmp_path):
     path.write_bytes(serialize(first_state()))
     with pytest.raises(CorruptState):
         store.read("probe-report")
-
-
-def test_lock_retries_a_delete_pending_lock_file(tmp_path, delete_pending):
-    # Windows: the previous holder's unlinked lock file is still "delete pending".
-    store = StateStore(tmp_path)
-    attempts = delete_pending("probe.lock", 3)
-    with store.locked("probe"):
-        assert store.lock_path("probe").exists()
-    assert len(attempts) == 4
-    assert not store.lock_path("probe").exists()
-
-
-def test_lock_persistent_permission_error_is_not_lock_held(tmp_path, delete_pending):
-    store = StateStore(tmp_path)
-    attempts = delete_pending("probe.lock", 10**6)
-    with pytest.raises(PermissionError):
-        with store.locked("probe"):
-            pass
-    assert len(attempts) == 26  # 25 bounded retries, then the error
-
-
-def test_lock_permission_error_is_not_retried_off_windows(tmp_path, delete_pending, monkeypatch):
-    from archshell.adapters import files
-
-    monkeypatch.setattr(files, "_WINDOWS", False)
-    store = StateStore(tmp_path)
-    attempts = delete_pending("probe.lock", 1)
-    with pytest.raises(PermissionError):
-        with store.locked("probe"):
-            pass
-    assert len(attempts) == 1
