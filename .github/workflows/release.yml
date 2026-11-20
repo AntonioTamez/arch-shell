@@ -187,6 +187,71 @@ jobs:
           [ "$out" = "archshell $PY_VERSION" ]
           uv run --no-sync python -c 'import sys, archshell_dotnet; assert archshell_dotnet.__version__ == sys.argv[1], archshell_dotnet.__version__' "$PY_VERSION"
 
+      - name: archshell-engine runs from the installed wheel
+        # `--version` alone loads no catalog, schema, or engine script, so a
+        # wheel missing package data would still pass it.
+        run: |
+          cd "$RUNNER_TEMP/archshell-install"
+          uv run --no-sync python - "$RUNNER_TEMP/engine-smoke" <<'EOF'
+          import importlib.resources, json, pathlib, shutil, subprocess, sys
+
+          root = pathlib.Path(sys.argv[1])
+          root.mkdir(parents=True)  # fresh: no state to resume
+          engine = shutil.which("archshell-engine")
+          assert engine, "archshell-engine is not on PATH"
+
+          def call(*argv, stdin="{}"):
+              done = subprocess.run(
+                  [engine, *argv], input=stdin.encode("utf-8"), cwd=root, capture_output=True
+              )
+              assert done.stdout, done.stderr.decode("utf-8", "replace")
+              return done.returncode, json.loads(done.stdout)
+
+          # next writes the prompt file.
+          code, first = call("next", "--feature", "probe", "--lang", "es")
+          assert code == 0 and first["type"] == "llm_task", first
+          prompt = root.joinpath(*first["prompt_file"].split("/"))
+          assert prompt.read_text(encoding="utf-8").strip(), prompt
+          # submit reads the config through the packaged config schema.
+          (root / ".archshell" / "config.yaml").write_bytes(
+              b"schema: archshell/config/v1\nmax_retries: 2\n"
+          )
+          # An invalid result is checked against the packaged JSON Schema.
+          submit = {
+              "schema": "archshell/submit/v1", "feature": "probe",
+              "action_id": first["action_id"], "revision": first["revision"],
+              "result": {"text": ""},
+          }
+          code, retry = call("submit", "--feature", "probe", stdin=json.dumps(submit))
+          assert code == 0 and retry["type"] == "llm_task", retry
+          assert retry["revision"] == first["revision"] + 1, retry
+          # A valid result advances to an ask, rendered from the Spanish catalog.
+          submit = {**submit, "action_id": retry["action_id"], "revision": retry["revision"],
+                    "result": {"text": "ok"}}
+          code, ask = call("submit", "--feature", "probe", "--lang", "es", stdin=json.dumps(submit))
+          assert code == 0 and ask["type"] == "ask", ask
+          package = importlib.resources.files("archshell")
+          es = package.joinpath("catalogs/es.yaml").read_text(encoding="utf-8")
+          en = package.joinpath("catalogs/en.yaml").read_text(encoding="utf-8")
+          assert ask["question"] in es and ask["question"] not in en, ask
+          # No command reads the record schema yet; it must still ship.
+          json.loads(package.joinpath("schemas/record-v1.json").read_text(encoding="utf-8"))
+          # guard-write blocks the engine-owned folder: host-neutral, then as the
+          # plugin calls it (--host claude-code, a Claude Code payload).
+          hook = {"schema": "archshell/hook/v1", "path": ".archshell/x"}
+          code, verdict = call("guard-write", stdin=json.dumps(hook))
+          assert code == 0 and verdict["code"] == "protected_path", verdict
+          payload = {
+              "session_id": "s", "transcript_path": "t.jsonl", "cwd": str(root),
+              "hook_event_name": "PreToolUse", "tool_name": "Write",
+              "tool_input": {"file_path": ".archshell/x"},
+          }
+          code, output = call("guard-write", "--host", "claude-code", stdin=json.dumps(payload))
+          assert code == 0, output
+          assert output["hookSpecificOutput"]["permissionDecision"] == "deny", output
+          print("archshell-engine smoke ok")
+          EOF
+
       - name: install Archshell.Analyzer from GitHub Packages
         env:
           GH_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
