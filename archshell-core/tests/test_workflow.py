@@ -536,3 +536,20 @@ def test_attempts_on_a_step_without_schema_is_invalid_state():
     data.update(attempts=1, errors=[{"path": "$", "message": "m"}])
     with pytest.raises(StateError):
         CursorState.from_dict(data)
+
+
+# --- issued() renders every language the same way (retro R12) -----------------
+
+
+@pytest.mark.parametrize("lang", ["en", "es"])
+def test_issued_renders_the_current_catalog_in_every_language(lang):
+    def old(message, language):
+        return f"old {language} {message.key}"
+
+    def new(message, language):
+        return f"new {language} {message.key}"
+
+    state = workflow.issue("probe", "probe", 1, 2, FreshIds("i", "n"), lang, old).state
+    assert state.issued(old).question == f"old {lang} flow.probe.ask.question"
+    # After a catalog change both languages show the current wording.
+    assert state.issued(new).question == f"new {lang} flow.probe.ask.question"

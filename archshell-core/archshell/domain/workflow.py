@@ -213,7 +213,8 @@ class CursorState:
 
     `action` is the pending action rendered in English (the state file is never
     localized); `lang` is the conversation language it was issued in, so a
-    repeated `next` returns it exactly as first issued (`issued`).
+    repeated `next` keeps that language (`issued`), with the wording of the
+    current catalog.
     """
 
     feature: str
@@ -231,17 +232,25 @@ class CursorState:
     def ended(self) -> bool:
         return self.action.terminal
 
+    @property
+    def pending_step(self) -> Step:
+        """The flow step the pending action was issued for."""
+        return FLOWS[self.flow][self.step]
+
     def issued(self, render: Renderer) -> Action:
-        """The pending action as the host received it: in the language it was issued in."""
-        if self.lang == DEFAULT_LANG:
-            return self.action
-        return replace(self.action, **step_texts(FLOWS[self.flow][self.step], self.lang, render))
+        """The pending action in the language it was issued in.
+
+        The stored action is the English record; the host's texts are rendered
+        from the current catalog in every language alike, so a catalog change
+        (an engine upgrade mid-flow) shows the same way in English and Spanish.
+        """
+        return replace(self.action, **step_texts(self.pending_step, self.lang, render))
 
     def pending_prompt(self) -> PromptFile | None:
         """The prompt file the pending action points at, or None if it has none."""
         if not isinstance(self.action, LlmTask):
             return None
-        step = FLOWS[self.flow][self.step]
+        step = self.pending_step
         text = retry_prompt(step, self.errors) if self.attempts else step.text
         return PromptFile(self.action.prompt_file, text)
 
@@ -425,8 +434,9 @@ def on_next(
 ) -> Outcome | Refusal:
     """Return the pending action, starting the feature's flow when there is no state.
 
-    A pending action comes back exactly as it was issued, whatever `lang` this
-    call carries: a new language takes effect from the next action on. The one
+    A pending action comes back as it was issued, in the language it was issued
+    in, whatever `lang` this call carries (a new language takes effect from the
+    next action on); its texts follow the current catalog. The one
     exception is an `llm_task` that has used every retry (`attempts > 0` and
     `attempts >= max_retries`): a new `next` is a rerun, so it re-issues the
     step as a fresh first attempt with a new retry cycle.

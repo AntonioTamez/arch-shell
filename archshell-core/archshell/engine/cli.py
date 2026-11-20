@@ -159,7 +159,8 @@ def _load_config_or_refuse(root: Path) -> Config:
     """The project config, or an `invalid_config` refusal.
 
     `load_config` is imported here, so a command that never reads the config
-    (the hooks, a `next` with no retries in use) does not load jsonschema.
+    (the hooks, a `next` with no retries in use, a `submit` of a step without
+    an output schema) does not load jsonschema.
     """
     from archshell.adapters.layout import InvalidConfig, load_config
 
@@ -196,7 +197,6 @@ def cmd_submit(feature: str, message: Message, store: StateStore, lang: str) -> 
             {"feature": feature, "message_feature": submission.feature},
         )
     require_flow(feature)
-    config = _load_config_or_refuse(store.root)
     # Imported here so `next` and the hooks do not pay for loading jsonschema.
     from archshell.adapters import output_schemas
 
@@ -208,10 +208,15 @@ def cmd_submit(feature: str, message: Message, store: StateStore, lang: str) -> 
 
     with store.locked(feature):
         state = store.read(feature)
+        # Only a pending step with an output schema uses `max_retries`; any
+        # other submit never reads the config, so an invalid one cannot block it.
+        retries = {}
+        if state is not None and not state.ended and state.pending_step.output_schema:
+            retries["max_retries"] = _load_config_or_refuse(store.root).max_retries
         outcome = workflow.on_submit(
             state, submission, fresh_ids(),
             validate=output_schemas.validate, render=catalogs.render, lang=lang,
-            max_retries=config.max_retries,
+            **retries,
         )
         if isinstance(outcome, workflow.Refusal):
             if outcome.code == "invalid_output":

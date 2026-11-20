@@ -143,7 +143,7 @@ max_retries: 2
 | `schema` | yes | `archshell/config/v1` |
 | `max_retries` | no (default 2) | integer 0–10: retries issued for an invalid `llm_task` result before `invalid_output` |
 
-No other keys are allowed. A missing `config.yaml` means the defaults. `submit` reads it on every call, and `next` when a step's retries are in use; an invalid one is refused with `invalid_config`.
+No other keys are allowed. A missing `config.yaml` means the defaults. `submit` reads it when the pending action is an `llm_task`, and `next` when a step's retries are in use; an invalid one is refused with `invalid_config`.
 
 ### Confirmation records (`archshell/record/v1`)
 
@@ -180,7 +180,7 @@ Until real feature workflows exist, two built-in flows exercise the action set: 
 
 `next` and `submit` take an optional `--lang en|es` (default `en`): the language of the developer's conversation, which only the host can see. The host passes `es` when the developer writes in Spanish and `en` otherwise (`archshell-claude-code/commands/run.md` says so); it never translates engine text itself. The engine renders every developer-facing text in that language: an `ask`/`confirm` `question`, `header`, and `options`, an `instruct_agent` `instruction`, a `report`/`done` `summary`, and the `message` of every error. Codes, `details`, every other field, and the one-message protocol do not change. An error raised before a valid `--lang` is read (an unknown command, a missing `--feature`, a bad `--lang`) is English; one raised after it (such as unexpected arguments after `--lang es`) is in that language.
 
-The text is rendered when an action is issued. A repeated `next` returns the pending action exactly as it was issued, whatever `--lang` it carries; a new language takes effect from the next action on. The state file holds the pending action in English plus the language it was issued in (`lang`; a state file without it reads as `en`).
+The language is fixed when an action is issued: a repeated `next` returns the pending action in the language it was issued in, whatever `--lang` it carries, and a new language takes effect from the next action on. The state file holds the pending action in English plus the language it was issued in (`lang`; a state file without it reads as `en`). The host's texts are rendered from the current catalog in every language, so after an engine upgrade that changes a catalog, a repeated `next` shows the new wording in English and Spanish alike.
 
 Texts live in per-language catalogs, `archshell-core/archshell/catalogs/en.yaml` and `es.yaml` (`schema: archshell/catalog/v1`, `lang`, and `messages`: a message key such as `flow.probe.ask.question` or `error.stale_action` mapped to a template with `{name}` placeholders; read as NFC). The domain names text only by key plus arguments; `archshell.adapters.catalogs` loads the files. Every catalog has the same keys with the same placeholders, and every key the code uses exists; `tests/test_messages.py` enforces both. Never localized: the `llm_task` prompt file and its retry text, the state file, records, config, logs, every other written file, and hook verdicts and hook errors (a hook gets no conversation language).
 
@@ -201,7 +201,7 @@ Error codes (`archshell/error/v1`, exit code 2):
 | `invalid_output` | an `llm_task` result still does not match its output schema after the retries; `details` holds `output_schema`, `error_count`, and `errors` (at most 10 `{path, message}` entries, paths and messages cut at 200 characters each) |
 | `locked` | another invocation holds the feature's lock |
 | `invalid_state` | the state file is unreadable |
-| `invalid_config` | `submit` (or `next` during a retry cycle) found a `.archshell/config.yaml` that is not UTF-8, not restricted-subset YAML, or does not match `archshell/config/v1`; `details` holds `config` (the path) and `errors` (at most 10 `{path, message}` entries); the state is unchanged |
+| `invalid_config` | `submit` of an `llm_task` (or `next` during a retry cycle) found a `.archshell/config.yaml` that is not UTF-8, not restricted-subset YAML, or does not match `archshell/config/v1`; `details` holds `config` (the path) and `errors` (at most 10 `{path, message}` entries); the state is unchanged |
 | `internal_error` | unexpected engine failure |
 
 On Windows machines where Application Control (Smart App Control) blocks unsigned executables, the uv launchers (`pytest.exe`, `archshell-engine.exe`) and the analyzer build output cannot start. Use the module forms instead: `uv run python -m pytest`, `echo '{}' | uv run python -m archshell.engine next --feature probe`.
@@ -212,7 +212,7 @@ Three commands give per-write, per-edit, and stop-time verdicts. The engine comp
 
 | Command | Options | stdin | Rule today |
 | --- | --- | --- | --- |
-| `guard-write` | `[--host <id>]` | `{"schema":"archshell/hook/v1","path":"<path>","cwd":"<dir>"}` (`cwd` optional) | `block` every path under `.archshell/` (AD-10), else `allow` |
+| `guard-write` | `[--host <id>]` | `{"schema":"archshell/hook/v1","path":"<path>","cwd":"<dir>"}` (`cwd` optional) | `block` every path under any `.archshell/` folder, nested ones included (AD-10), else `allow` |
 | `check-edit` | `[--host <id>]` | same as `guard-write` | always `allow` (per-edit checks come with epic 4) |
 | `on-stop` | `[--feature <slug>] [--host <id>]` | `{"schema":"archshell/hook/v1"}` | always `allow` (stop gates come later) |
 
