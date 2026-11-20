@@ -104,7 +104,7 @@ Action fields (all types): `schema`, `type`, `feature`, `action_id`, `revision`,
 | `report` | `summary` | | yes |
 | `done` | `summary` | | yes |
 
-An `llm_task` does not carry its prompt inline. `prompt_file` is a POSIX path, relative to the project root, of `.archshell/state/prompts/<action_id>.md`, which the engine writes before it replies and which holds the prompt with line endings normalized to LF, UTF-8 without BOM. The file stays while the task is pending; a repeated `next` returns the same `prompt_file` and rewrites the file only if it is missing or differs from the prompt.
+An `llm_task` does not carry its prompt inline. `prompt_file` is a POSIX path, relative to the project root, of `.archshell/state/prompts/<action_id>.md`, which the engine writes before it replies and which holds the prompt with line endings normalized to LF, UTF-8 without BOM. The file stays while the task is pending; a repeated `next` returns the same `prompt_file` and rewrites the file only if it is missing or differs from the prompt. Once the task is no longer pending (accepted, retried, or restarted), the engine deletes its prompt file after writing the new state; a failed delete only leaves the file behind.
 
 An `ask` or `confirm` also carries the question text the host shows, written by the engine: `header` (non-blank, at most 12 characters) and `options` (2 to 4 unique, non-blank labels). The host never writes its own question text. For `confirm`, the first option confirms and every other option declines. An `ask` or `confirm` without valid `header` and `options` is not a valid action.
 
