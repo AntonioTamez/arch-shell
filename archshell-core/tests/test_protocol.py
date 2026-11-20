@@ -687,3 +687,53 @@ def test_a_full_flow_leaves_no_prompt_files(project):
     while action["type"] != "done":
         action = assert_ok(*project.submit(submission_for(action)))
     assert prompt_files(project) == []
+
+
+# --- config read only where it matters (retro R10) ---------------------------
+
+
+def test_submit_of_a_step_without_output_schema_ignores_an_invalid_config(project):
+    ask = advance_to(project, "ask")
+    project.root.joinpath(".archshell", "config.yaml").write_bytes(b"max_retries: nope\n")
+    assert assert_ok(*project.submit(submission_for(ask)))["type"] == "confirm"
+
+
+def test_submit_of_an_llm_task_still_refuses_an_invalid_config(project):
+    first = assert_ok(*project.next())
+    project.root.joinpath(".archshell", "config.yaml").write_bytes(b"max_retries: nope\n")
+    before = project.state_bytes()
+    assert_refused(*project.submit(submission_for(first)), "invalid_config")
+    assert project.state_bytes() == before
+
+
+# --- nested .archshell/ is guarded too (R4 review) ----------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["sub/.archshell/state/probe.yaml", "a/b/.ARCHSHELL/x", "sub/.archshell", "sub/.archshell./x"],
+)
+def test_guard_write_blocks_a_nested_archshell_folder(project, path):
+    code, verdict = project.engine(
+        "guard-write", stdin=json.dumps({"schema": "archshell/hook/v1", "path": path}).encode("utf-8")
+    )
+    assert code == 0
+    assert (verdict["verdict"], verdict["code"]) == ("block", "protected_path")
+
+
+@pytest.mark.parametrize("path", ["src/archshell/x.py", "docs/.archshell-notes.md"])
+def test_guard_write_allows_names_that_only_look_like_archshell(project, path):
+    code, verdict = project.engine(
+        "guard-write", stdin=json.dumps({"schema": "archshell/hook/v1", "path": path}).encode("utf-8")
+    )
+    assert code == 0
+    assert verdict["verdict"] == "allow"
+
+
+def test_submit_with_no_state_is_no_pending_action_even_with_an_invalid_config(project):
+    project.root.joinpath(".archshell").mkdir()
+    project.root.joinpath(".archshell", "config.yaml").write_bytes(b"max_retries: nope\n")
+    message = submission_for(
+        {"type": "llm_task", "feature": "probe", "action_id": "x", "revision": 1}
+    )
+    assert_refused(*project.submit(message), "no_pending_action")

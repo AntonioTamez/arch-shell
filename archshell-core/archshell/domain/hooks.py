@@ -152,8 +152,12 @@ def relative_to_root(path: str, base: str, root: str) -> list[str] | None:
 
 
 def is_protected(relative: list[str]) -> bool:
-    """The protected set: everything under `.archshell/` (AD-10)."""
-    return bool(relative) and _key(relative[0]) == PROTECTED_DIR
+    """The protected set: everything under any `.archshell/` folder (AD-10).
+
+    A nested one (`sub/.archshell/`) is guarded too: it is another engine root
+    (an engine run from `sub/` writes there), never a place for agent writes.
+    """
+    return any(_key(segment) == PROTECTED_DIR for segment in relative)
 
 
 def guard_write(hook: HookInput, root: str) -> Verdict:
