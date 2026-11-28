@@ -81,3 +81,14 @@ def test_every_card_pattern_is_a_charter_pattern():
     schema = json.loads((SCHEMAS / "charter-v1.json").read_bytes().decode("utf-8"))
     allowed = set(schema["properties"]["patterns"]["items"]["enum"])
     assert {p for card in scoring.CARDS for p in card.patterns} == allowed
+
+
+def test_a_kept_proposal_reads_back_as_scored_without_scores():
+    proposal = propose(modules("A", "B"))
+    kept = json.loads(json.dumps(scoring.as_result(proposal)))
+    assert kept == {"card": "clean-screaming", "title": "Clean + Screaming",
+                    "patterns": ["clean", "screaming"]}
+    back = scoring.from_result(kept)
+    assert (back.card, back.title, back.patterns, back.scores) == (
+        proposal.card, proposal.title, proposal.patterns, ()
+    )

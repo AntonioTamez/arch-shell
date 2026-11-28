@@ -33,6 +33,11 @@ COMMANDS = sorted((PLUGIN / "commands").glob("*.md"))
 AGENTS = sorted((PLUGIN / "agents").glob("*.md"))
 MARKDOWN = COMMANDS + AGENTS
 RUN = PLUGIN / "commands" / "run.md"
+INIT = PLUGIN / "commands" / "init.md"
+# Commands that run the host loop; each must state every action-protocol rule.
+LOOPS = [RUN, INIT]
+# The feature each loop passes: `run.md` its argument, `init.md` always `bootstrap`.
+LOOP_FEATURE = {RUN: "'<slug>'", INIT: "'bootstrap'"}
 AGENT = PLUGIN / "agents" / "archshell-task.md"
 ENGINE_EXPANSION = "${ARCHSHELL_ENGINE:-archshell-engine}"
 
@@ -82,15 +87,17 @@ def test_frontmatter_parses_with_a_description(path):
     assert body.strip()
 
 
-def test_run_covers_every_action_type():
-    _, body = frontmatter(RUN)
+@pytest.mark.parametrize("loop", LOOPS, ids=lambda p: p.name)
+def test_run_covers_every_action_type(loop):
+    _, body = frontmatter(loop)
     for action_type in ACTION_TYPES:
         assert f"### `{action_type}`" in body, action_type
     assert body.count("\n### `") == len(ACTION_TYPES)
 
 
-def test_run_uses_the_engine_override_for_every_call():
-    fields, body = frontmatter(RUN)
+@pytest.mark.parametrize("loop", LOOPS, ids=lambda p: p.name)
+def test_run_uses_the_engine_override_for_every_call(loop):
+    fields, body = frontmatter(loop)
     assert "ARCHSHELL_ENGINE" in body
     assert f"{ENGINE_EXPANSION} next --feature" in body
     assert f"{ENGINE_EXPANSION} submit --feature" in body
@@ -100,8 +107,9 @@ def test_run_uses_the_engine_override_for_every_call():
     assert f"Bash({ENGINE_EXPANSION} submit:*)" in fields["allowed-tools"]
 
 
-def test_run_sends_messages_on_stdin():
-    _, body = frontmatter(RUN)
+@pytest.mark.parametrize("loop", LOOPS, ids=lambda p: p.name)
+def test_run_sends_messages_on_stdin(loop):
+    _, body = frontmatter(loop)
     assert body.count("<<'ARCHSHELL_MESSAGE'") == 2
 
 
@@ -113,8 +121,9 @@ def action_section(body: str, action_type: str) -> str:
 
 
 @pytest.mark.parametrize("action_type", ["ask", "confirm"])
-def test_run_answers_questions_with_the_tool_nonce_and_human_source(action_type):
-    fields, body = frontmatter(RUN)
+@pytest.mark.parametrize("loop", LOOPS, ids=lambda p: p.name)
+def test_run_answers_questions_with_the_tool_nonce_and_human_source(action_type, loop):
+    fields, body = frontmatter(loop)
     assert "AskUserQuestion" in fields["allowed-tools"]
     section = action_section(body, action_type)
     assert "AskUserQuestion" in section
@@ -126,14 +135,16 @@ def test_run_answers_questions_with_the_tool_nonce_and_human_source(action_type)
 
 
 @pytest.mark.parametrize("action_type", ["llm_task", "instruct_agent", "report", "done"])
-def test_run_adds_nonce_and_source_only_to_questions(action_type):
-    _, body = frontmatter(RUN)
+@pytest.mark.parametrize("loop", LOOPS, ids=lambda p: p.name)
+def test_run_adds_nonce_and_source_only_to_questions(action_type, loop):
+    _, body = frontmatter(loop)
     section = action_section(body, action_type)
     assert "nonce" not in section and "human_ui" not in section
 
 
-def test_run_submits_the_result_shape_of_each_action():
-    _, body = frontmatter(RUN)
+@pytest.mark.parametrize("loop", LOOPS, ids=lambda p: p.name)
+def test_run_submits_the_result_shape_of_each_action(loop):
+    _, body = frontmatter(loop)
     assert '{"text": <the agent\'s reply, verbatim>}' in action_section(body, "llm_task")
     assert '{"answer":' in action_section(body, "ask")
     confirm = action_section(body, "confirm")
@@ -143,34 +154,38 @@ def test_run_submits_the_result_shape_of_each_action():
         assert "Submit nothing" in action_section(body, terminal)
 
 
-def test_run_never_authors_question_text_or_status_lines():
-    _, body = frontmatter(RUN)
+@pytest.mark.parametrize("loop", LOOPS, ids=lambda p: p.name)
+def test_run_never_authors_question_text_or_status_lines(loop):
+    _, body = frontmatter(loop)
     assert "`Yes`" not in body and "`No`" not in body
     assert "`ArchShell`" not in body
     assert "running agent task" not in body
 
 
-def test_run_passes_the_agent_an_absolute_prompt_path():
-    _, body = frontmatter(RUN)
+@pytest.mark.parametrize("loop", LOOPS, ids=lambda p: p.name)
+def test_run_passes_the_agent_an_absolute_prompt_path(loop):
+    _, body = frontmatter(loop)
     section = action_section(body, "llm_task")
     assert "absolute path" in section
     assert "joined with `prompt_file`" in section
 
 
-def test_run_stops_on_engine_errors_and_unknown_types():
-    _, body = frontmatter(RUN)
+@pytest.mark.parametrize("loop", LOOPS, ids=lambda p: p.name)
+def test_run_stops_on_engine_errors_and_unknown_types(loop):
+    _, body = frontmatter(loop)
     assert "archshell/error/v1" in body
     assert "unsupported action type" in body
     assert "do not retry" in body
 
 
-def test_agent_exists_and_is_referenced_by_its_plugin_qualified_name():
+@pytest.mark.parametrize("loop", LOOPS, ids=lambda p: p.name)
+def test_agent_exists_and_is_referenced_by_its_plugin_qualified_name(loop):
     fields, _ = frontmatter(AGENT)
     assert fields["name"] == AGENT.stem == "archshell-task"
     assert fields["tools"] == "Read"
     qualified = f"{plugin_name()}:{fields['name']}"
     assert qualified == "archshell:archshell-task"
-    fields_run, body = frontmatter(RUN)
+    fields_run, body = frontmatter(loop)
     assert f"`subagent_type` `{qualified}`" in body
     assert "Agent" in fields_run["allowed-tools"]
 
@@ -236,12 +251,24 @@ def test_guard_write_hook_fails_closed_when_the_engine_cannot_run():
     assert command.count(" && ") == 1 and command.index(" && ") < command.index(" || { ")
 
 
-def test_run_passes_the_conversation_language_on_every_call():
-    _, body = frontmatter(RUN)
-    assert f"{ENGINE_EXPANSION} next --feature '<slug>' --lang <lang> " in body
-    assert f"{ENGINE_EXPANSION} submit --feature '<slug>' --lang <lang> " in body
+@pytest.mark.parametrize("loop", LOOPS, ids=lambda p: p.name)
+def test_run_passes_the_conversation_language_on_every_call(loop):
+    _, body = frontmatter(loop)
+    feature = LOOP_FEATURE[loop]
+    assert f"{ENGINE_EXPANSION} next --feature {feature} --lang <lang> " in body
+    assert f"{ENGINE_EXPANSION} submit --feature {feature} --lang <lang> " in body
     assert "`es` when the developer writes to you in Spanish, `en` otherwise" in body
     assert "never translate engine text yourself" in body
+
+
+def test_run_takes_the_feature_argument_and_init_is_fixed_to_bootstrap():
+    run_fields, run_body = frontmatter(RUN)
+    assert run_fields["argument-hint"] == "<feature>"
+    assert "The feature slug is `$ARGUMENTS`" in run_body
+    init_fields, init_body = frontmatter(INIT)
+    assert "argument-hint" not in init_fields
+    assert "$ARGUMENTS" not in init_body
+    assert "The feature slug is always `bootstrap`" in init_body
 
 
 # --- engine interface: the `human_ui` run (story 1.13, AD-18) -----------------

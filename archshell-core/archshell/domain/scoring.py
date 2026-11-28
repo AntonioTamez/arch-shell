@@ -37,6 +37,16 @@ class Proposal:
     scores: tuple[tuple[str, Decimal], ...]
 
 
+def as_result(proposal: Proposal) -> dict[str, Any]:
+    """The proposal as kept in cursor state (JSON data; scores are not kept)."""
+    return {"card": proposal.card, "title": proposal.title, "patterns": list(proposal.patterns)}
+
+
+def from_result(result: Mapping[str, Any]) -> Proposal:
+    """A proposal kept with `as_result`, as it was scored and shown."""
+    return Proposal(result["card"], result["title"], tuple(result["patterns"]), ())
+
+
 def _module_count(drivers: Mapping[str, Any]) -> int:
     modules = drivers.get("modules")
     return len(modules) if isinstance(modules, list) else 0

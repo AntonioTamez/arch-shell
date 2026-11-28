@@ -116,10 +116,17 @@ class Step:
     # Issuing this step hands the engine shell this effect (built from the
     # earlier results) to execute before the new state is written.
     effect: Callable[[Results], Any] | None = None
+    # Further results kept when this step's result is accepted, each built
+    # from that (parsed) result: (name, builder) pairs.
+    derives: tuple[tuple[str, Callable[[Any], Any]], ...] = ()
 
     def prompt_text(self, results: Results) -> str:
         """An `llm_task`'s prompt: built from the results, else `text` itself."""
         return self.prompt(results) if self.prompt is not None else self.text
+
+    def kept_names(self) -> tuple[str, ...]:
+        """The results names this step adds once its result is accepted."""
+        return ((self.name,) if self.name else ()) + tuple(name for name, _ in self.derives)
 
 
 LLM_TEXT_SCHEMA = "archshell/llm-text/v1"
@@ -135,7 +142,9 @@ def _request(results: Results) -> str:
 
 
 def _proposal(results: Results) -> scoring.Proposal:
-    return scoring.propose(results["drivers"])
+    """The proposal scored when the drivers were accepted, as kept in state:
+    the confirm shows it and the write records it, never a re-scoring (FR-7)."""
+    return scoring.from_result(results["proposal"])
 
 
 def _proposal_args(results: Results) -> dict[str, str]:
@@ -167,13 +176,14 @@ _BOOTSTRAP: tuple[Step, ...] = (
         prompt=lambda results: charter.drivers_prompt(_request(results)),
         json_text=True,
         check=charter.drivers_problems,
+        derives=(("proposal", lambda drivers: scoring.as_result(scoring.propose(drivers))),),
     ),
     Step(
         "confirm",
         "flow.bootstrap.confirm.question",
         header="flow.bootstrap.confirm.header",
         options=("flow.bootstrap.confirm.accept", "flow.bootstrap.confirm.decline"),
-        name="proposal",
+        name="confirmation",
         args=_proposal_args,
         on_decline="declined",
     ),
@@ -450,13 +460,15 @@ class CursorState:
 
 
 def parse_state_results(value: Any, flow: str, step: int) -> Results:
-    """`results`: an object keyed by names of steps before the cursor."""
+    """`results`: an object keyed by exactly the names the steps before the
+    cursor keep (a pending step's texts and prompt are built from them)."""
     if not isinstance(value, dict):
         raise StateError("results must be an object")
-    earlier = {s.name for s in FLOWS[flow][:step] if s.name}
-    unknown = sorted(str(key) for key in set(value) - earlier)
-    if unknown:
-        raise StateError(f"results name no earlier step: {', '.join(unknown)}")
+    expected = {name for s in FLOWS[flow][:step] for name in s.kept_names()}
+    if set(value) != expected:
+        raise StateError(
+            f"results must hold exactly {sorted(expected)}, found {sorted(map(str, value))}"
+        )
     return MappingProxyType(dict(value))
 
 
@@ -717,6 +729,8 @@ def on_submit(
     results: Results = state.results
     if current.name:
         results = {**results, current.name: value}
+    for name, build in current.derives:
+        results = {**results, name: build(value)}
     target = state.step + 1
     if current.on_decline and submission.result["confirmed"] is False:
         target = step_index(state.flow, current.on_decline)

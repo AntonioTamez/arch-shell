@@ -22,7 +22,7 @@ import pytest
 from conftest import ScriptedHost, tree
 
 from archshell.adapters import catalogs, extensions, journal, yaml_read
-from archshell.domain import charter, layout, workflow
+from archshell.domain import charter, layout, scoring, workflow
 from archshell.engine import cli
 
 PINNED_ENGINE = [sys.executable, str(Path(__file__).parent / "pinned_engine.py")]
@@ -274,6 +274,14 @@ def test_spanish_run_renders_es_and_writes_the_en_bytes(tmp_path):
     assert read_yaml(es, BASE)["request"] == SPANISH_REQUEST
 
 
+def test_spanish_decline_reports_in_es_and_writes_nothing(tmp_path):
+    host = scripted(tmp_path, THREE_MODULES, lang="es", request=SPANISH_REQUEST, confirm=False)
+    flow = host.run_flow("bootstrap", records=False)
+    assert [a["type"] for a in flow] == ["ask", "llm_task", "confirm", "report"]
+    assert flow[-1]["summary"] == ES["flow.bootstrap.declined"]
+    nothing_charter_written(host)
+
+
 # --- in-process engine (monkeypatched extensions) -----------------------------
 
 
@@ -363,7 +371,43 @@ def test_results_are_kept_in_state_for_later_steps(tmp_path, monkeypatch):
     engine = InProcess(tmp_path, monkeypatch)
     engine.to_confirm()
     state = json.loads((engine.root / ".archshell/state/bootstrap.yaml").read_bytes())
-    assert state["results"] == {"request": {"answer": REQUEST}, "drivers": THREE_MODULES}
+    assert state["results"] == {
+        "request": {"answer": REQUEST},
+        "drivers": THREE_MODULES,
+        "proposal": {
+            "card": "clean-screaming", "title": "Clean + Screaming",
+            "patterns": ["clean", "screaming"],
+        },
+    }
+
+
+def test_state_missing_an_earlier_result_is_invalid_state(tmp_path, monkeypatch):
+    engine = InProcess(tmp_path, monkeypatch)
+    engine.to_confirm()
+    path = engine.root / ".archshell/state/bootstrap.yaml"
+    data = json.loads(path.read_bytes())
+    for missing in ("drivers", "proposal"):
+        broken = {**data, "results": {k: v for k, v in data["results"].items() if k != missing}}
+        with pytest.raises(workflow.StateError):
+            workflow.CursorState.from_dict(broken)
+    data["results"] = {"request": data["results"]["request"]}
+    path.write_text(json.dumps(data), encoding="utf-8")
+    code, reply = engine.call("next", "--feature", "bootstrap")
+    assert_refused(code, reply, "invalid_state")
+
+
+def test_confirm_and_write_use_the_kept_proposal_not_a_rescoring(tmp_path, monkeypatch):
+    engine = InProcess(tmp_path, monkeypatch)
+    confirm = engine.to_confirm()
+    assert "Clean + Screaming" in confirm["question"]
+    other = scoring.Proposal("clean", "Clean", ("clean",), ())
+    monkeypatch.setattr(scoring, "propose", lambda drivers, cards=scoring.CARDS: other)
+    code, again = engine.call("next", "--feature", "bootstrap")
+    assert again["question"] == confirm["question"]
+    done = engine.advance(confirm, {"confirmed": True})
+    assert "Clean + Screaming" in done["summary"]
+    base = yaml_read.load((engine.root / BASE).read_bytes().decode("utf-8"))
+    assert base["patterns"] == ["clean", "screaming"]
 
 
 def test_state_without_results_still_loads(tmp_path, monkeypatch):

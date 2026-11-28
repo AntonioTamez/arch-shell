@@ -27,11 +27,13 @@ def tree(root: Path) -> list[str]:
 
 
 def engine_process(
-    cwd: Path | None, *argv: str, stdin: bytes = b"{}"
+    cwd: Path | None, *argv: str, stdin: bytes = b"{}", engine: list[str] | None = None
 ) -> subprocess.CompletedProcess[bytes]:
-    """Run the engine with `argv` in `cwd` (the current directory when None)."""
+    """Run the engine with `argv` in `cwd` (the current directory when None);
+    `engine` replaces the engine command line (default `ENGINE`)."""
     return subprocess.run(
-        ENGINE + list(argv), input=stdin, capture_output=True, cwd=cwd, timeout=60
+        (ENGINE if engine is None else engine) + list(argv),
+        input=stdin, capture_output=True, cwd=cwd, timeout=60,
     )
 
 
@@ -43,14 +45,15 @@ def single_json_line(stdout: bytes | str, stderr: bytes = b"") -> dict:
 
 
 def run_engine(
-    cwd: Path, *argv: str, stdin: bytes = b"{}", single_line: bool = True
+    cwd: Path, *argv: str, stdin: bytes = b"{}", single_line: bool = True,
+    engine: list[str] | None = None,
 ) -> tuple[int, dict]:
     """Run the engine in `cwd`; return its exit code and stdout message.
 
     With `single_line=False` stdout is parsed as JSON without checking that it
     is exactly one line.
     """
-    proc = engine_process(cwd, *argv, stdin=stdin)
+    proc = engine_process(cwd, *argv, stdin=stdin, engine=engine)
     if single_line:
         return proc.returncode, single_json_line(proc.stdout, proc.stderr)
     return proc.returncode, json.loads(proc.stdout.decode("utf-8"))
@@ -195,15 +198,10 @@ class ScriptedHost:
 
     def engine(self, command: str, feature: str, message: dict | None = None) -> tuple[int, dict]:
         stdin = json.dumps({} if message is None else message).encode("utf-8")
-        argv = (command, "--feature", feature, "--lang", self.lang)
-        if self.engine_argv is None:
-            result = run_engine(self.root, *argv, stdin=stdin)
-        else:
-            proc = subprocess.run(
-                self.engine_argv + list(argv), input=stdin, capture_output=True,
-                cwd=self.root, timeout=60,
-            )
-            result = proc.returncode, single_json_line(proc.stdout, proc.stderr)
+        result = run_engine(
+            self.root, command, "--feature", feature, "--lang", self.lang,
+            stdin=stdin, engine=self.engine_argv,
+        )
         self._collect_written()
         return result
 
