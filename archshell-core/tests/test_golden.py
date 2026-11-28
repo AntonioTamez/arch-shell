@@ -7,8 +7,9 @@ with the committed `golden/manifest.sha256` (`<sha256>  <name>` lines, sorted).
 CI runs this on Windows, Linux, and macOS: all three matching one committed
 manifest means they match each other.
 
-The manifest also holds `no-op/...` entries, checked by `test_no_op_flow.py`;
-this test ignores them. To update the manifest after an intended change,
+The manifest also holds `no-op/...` entries, checked by `test_no_op_flow.py`,
+and `bootstrap/...` entries, checked by `test_bootstrap_flow.py`; this test
+ignores them. To update the manifest after an intended change,
 replace its other lines with the "actual manifest" printed by the failing test.
 """
 
@@ -24,6 +25,8 @@ from archshell.render.yaml_emit import emit
 
 GOLDEN = Path(__file__).parent / "golden"
 NO_OP_PREFIX = "no-op/"
+# `bootstrap/...` entries belong to test_bootstrap_flow.py.
+END_TO_END_PREFIXES = (NO_OP_PREFIX, "bootstrap/")
 
 
 def _outputs() -> dict[str, str]:
@@ -50,7 +53,9 @@ def test_golden_outputs_match_committed_sha256(tmp_path):
         hashes[name] = hashlib.sha256(data).hexdigest()
     lines = (GOLDEN / "manifest.sha256").read_bytes().decode("utf-8").splitlines(keepends=True)
     # `no-op/...` entries belong to test_no_op_flow.py (the end-to-end run).
-    expected = "".join(line for line in lines if not line.split("  ", 1)[1].startswith(NO_OP_PREFIX))
+    expected = "".join(
+        line for line in lines if not line.split("  ", 1)[1].startswith(END_TO_END_PREFIXES)
+    )
     actual = _manifest(hashes)
     assert actual == expected, f"golden bytes differ; actual manifest:\n{actual}"
 

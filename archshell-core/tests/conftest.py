@@ -27,11 +27,13 @@ def tree(root: Path) -> list[str]:
 
 
 def engine_process(
-    cwd: Path | None, *argv: str, stdin: bytes = b"{}"
+    cwd: Path | None, *argv: str, stdin: bytes = b"{}", engine: list[str] | None = None
 ) -> subprocess.CompletedProcess[bytes]:
-    """Run the engine with `argv` in `cwd` (the current directory when None)."""
+    """Run the engine with `argv` in `cwd` (the current directory when None);
+    `engine` replaces the engine command line (default `ENGINE`)."""
     return subprocess.run(
-        ENGINE + list(argv), input=stdin, capture_output=True, cwd=cwd, timeout=60
+        (ENGINE if engine is None else engine) + list(argv),
+        input=stdin, capture_output=True, cwd=cwd, timeout=60,
     )
 
 
@@ -43,14 +45,15 @@ def single_json_line(stdout: bytes | str, stderr: bytes = b"") -> dict:
 
 
 def run_engine(
-    cwd: Path, *argv: str, stdin: bytes = b"{}", single_line: bool = True
+    cwd: Path, *argv: str, stdin: bytes = b"{}", single_line: bool = True,
+    engine: list[str] | None = None,
 ) -> tuple[int, dict]:
     """Run the engine in `cwd`; return its exit code and stdout message.
 
     With `single_line=False` stdout is parsed as JSON without checking that it
     is exactly one line.
     """
-    proc = engine_process(cwd, *argv, stdin=stdin)
+    proc = engine_process(cwd, *argv, stdin=stdin, engine=engine)
     if single_line:
         return proc.returncode, single_json_line(proc.stdout, proc.stderr)
     return proc.returncode, json.loads(proc.stdout.decode("utf-8"))
@@ -152,21 +155,42 @@ class ScriptedHost:
     `{"confirmed"}` plus the action's `nonce` and `source: "human_ui"` for
     `ask` / `confirm`, `{"status": "done"}` for `instruct_agent`) until a
     terminal `done` or `report`, always with `--lang`. The "user" picks the
-    first option; the "agent" reads the prompt file and replies with one
-    sentence. Hooks run the literal `hooks/hooks.json` command strings through
+    first option and confirms, and the "agent" reads the prompt file and
+    replies with one sentence, unless scripted replies (`answers`,
+    `confirmations`, `agent_replies`) say otherwise. Hooks run the literal `hooks/hooks.json` command strings through
     bash, with `ARCHSHELL_ENGINE` set to the module form (Smart App Control
     blocks the uv launchers). Every action, submission, hook run, and
     engine-written file is recorded.
     """
 
-    def __init__(self, root: Path, lang: str = "en", log_dir: Path | None = None):
+    def __init__(
+        self,
+        root: Path,
+        lang: str = "en",
+        log_dir: Path | None = None,
+        *,
+        answers: list[str] | None = None,
+        agent_replies: list[str] | None = None,
+        confirmations: list[bool] | None = None,
+        engine_argv: list[str] | None = None,
+    ):
         self.root = root
         self.lang = lang
         self.log_dir = log_dir if log_dir is not None else root.parent / "host-tmp"
+        # Scripted per-step replies, used in order: the "user's" typed `ask`
+        # answers and `confirm` choices, and the "agent's" `llm_task` replies.
+        # Once a list runs out the defaults apply (first option, confirm, one
+        # sentence).
+        self.answers = list(answers or [])
+        self.agent_replies = list(agent_replies or [])
+        self.confirmations = list(confirmations or [])
+        # The engine command line (default: the module form).
+        self.engine_argv = list(engine_argv) if engine_argv is not None else None
         self.actions: list[dict] = []
         self.submissions: list[dict] = []
         self.hook_runs: list[HookRun] = []
         self.records: list = []  # the records read back after the last `done`
+        self.prompts: list[bytes] = []  # every prompt file the agent read
         # Project-relative POSIX path -> the last bytes seen there.
         self.written: dict[str, bytes] = {}
 
@@ -175,7 +199,8 @@ class ScriptedHost:
     def engine(self, command: str, feature: str, message: dict | None = None) -> tuple[int, dict]:
         stdin = json.dumps({} if message is None else message).encode("utf-8")
         result = run_engine(
-            self.root, command, "--feature", feature, "--lang", self.lang, stdin=stdin
+            self.root, command, "--feature", feature, "--lang", self.lang,
+            stdin=stdin, engine=self.engine_argv,
         )
         self._collect_written()
         return result
@@ -199,16 +224,17 @@ class ScriptedHost:
         """The no-op agent: read the prompt file by its absolute path, reply once."""
         prompt = self.root.joinpath(*action["prompt_file"].split("/")).read_bytes()
         assert prompt.strip(), action
-        return "Received the task."
+        self.prompts.append(prompt)
+        return self.agent_replies.pop(0) if self.agent_replies else "Received the task."
 
     def result_for(self, action: dict) -> dict:
         kind = action["type"]
         if kind == "llm_task":
             return {"text": self.agent_reply(action)}
         if kind == "ask":
-            return {"answer": action["options"][0]}
+            return {"answer": self.answers.pop(0) if self.answers else action["options"][0]}
         if kind == "confirm":
-            return {"confirmed": True}
+            return {"confirmed": self.confirmations.pop(0) if self.confirmations else True}
         if kind == "instruct_agent":
             return {"status": "done"}
         raise AssertionError(f"unsupported action type: {kind}")
@@ -233,24 +259,25 @@ class ScriptedHost:
         assert code == 0 and reply["schema"] == "archshell/action/v1", reply
         return reply
 
-    def finish(self, action: dict) -> list[dict]:
+    def finish(self, action: dict, records: bool = True) -> list[dict]:
         """Answer from `action` on until a terminal action, then run the Stop hook.
 
-        After `done`, the confirmed flow is recorded: a `plan` record, twice.
+        After `done`, the confirmed flow is recorded (unless `records` is
+        false): a `plan` record, twice.
         """
         flow = [action]
         while flow[-1]["type"] not in TERMINAL_TYPES:
             flow.append(self.answer(flow[-1]))
         run = self.hook("Stop", stop_payload(self.root))
         assert (run.code, run.stdout) == (0, ""), run
-        if flow[-1]["type"] == "done":
+        if records and flow[-1]["type"] == "done":
             content = {"flow": flow[-1]["feature"], "actions": [a["type"] for a in flow]}
             self.records = self.write_records(flow[-1]["feature"], content)
         return flow
 
-    def run_flow(self, feature: str) -> list[dict]:
+    def run_flow(self, feature: str, records: bool = True) -> list[dict]:
         """Drive `feature` from `next` to its terminal action, then the Stop hook."""
-        return self.finish(self.next(feature))
+        return self.finish(self.next(feature), records)
 
     # hooks.json -----------------------------------------------------------
 

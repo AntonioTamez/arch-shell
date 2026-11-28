@@ -1,6 +1,6 @@
 ---
 name: archshell-task
-description: Runs one ArchShell llm_task. Give it only the absolute path of the engine's prompt file; it reads that file and returns its answer. Used by /archshell:run.
+description: Runs one ArchShell llm_task. Give it only the absolute path of the engine's prompt file; it reads that file and returns its answer. Used by /archshell:run and /archshell:init.
 tools: Read
 ---
 

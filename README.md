@@ -57,7 +57,7 @@ uv run python -c "import sys; from importlinter.cli import lint_imports; sys.exi
 
 ### Extension loading (AD-14, FR-36)
 
-Extensions are objects that distributions register under entry-point groups. `archshell.adapters.extensions.load(kind)` loads one group; `language_packs()` returns the packs keyed by language. No engine or CLI command calls the loader yet. There is no `archshell.hosts` group: host adapters (the Claude Code plugin) are files, not Python.
+Extensions are objects that distributions register under entry-point groups. `archshell.adapters.extensions.load(kind)` loads one group; `language_packs()` returns the packs keyed by language. The `bootstrap` flow loads the language packs when it writes the charter; a refused pack reaches `archshell/error/v1` with its code. There is no `archshell.hosts` group: host adapters (the Claude Code plugin) are files, not Python.
 
 | Kind | Entry-point group | `extension_contract` this core supports |
 | --- | --- | --- |
@@ -120,7 +120,7 @@ Every command works in the project root: the nearest folder at or above the work
 
 ### `.archshell/` layout (AD-10)
 
-Every engine-owned path is named in one module, `archshell.domain.layout`. `archshell.adapters.layout.create_layout(root)` builds the layout in a project; no CLI command runs it yet (bootstrap comes later). It is idempotent: it never overwrites an existing `config.yaml`, and a rerun changes no bytes. `next`, `submit`, and the hooks do not create the layout; they create only the directories they write into, and a refused command creates no `.archshell/` at all.
+Every engine-owned path is named in one module, `archshell.domain.layout`. `archshell.adapters.layout.create_layout(root)` builds the layout in a project; the `bootstrap` flow runs it when it writes the charter. It is idempotent: it never overwrites an existing `config.yaml`, and a rerun changes no bytes. `next`, `submit`, and the hooks do not create the layout; they create only the directories they write into, and a refused command creates no `.archshell/` at all.
 
 | Path | Tracked by git | Purpose |
 | --- | --- | --- |
@@ -129,7 +129,9 @@ Every engine-owned path is named in one module, `archshell.domain.layout`. `arch
 | `.archshell/charter/`, `vocabulary/`, `features/`, `records/`, `derived/` | yes | created empty (git does not track empty directories) |
 | `.archshell/state/` | no | cursor state `<slug>.yaml`, `llm_task` prompts under `state/prompts/` |
 | `.archshell/locks/` | no | per-feature lock files |
-| `.archshell/txn.json` | no | reserved for the transaction journal |
+| `.archshell/charter/base.yaml` | yes | the confirmed charter (`archshell/charter/v1`), written by the `bootstrap` flow |
+| `architecture.yaml` (project root) | yes | the architecture rendered from `base.yaml` plus version pins (`archshell/architecture/v1`) |
+| `.archshell/txn.json` | no | the write journal: present only while a journaled write is in progress |
 
 `config.yaml` is written with the canonical YAML emitter and read with the restricted-subset reader, then validated against `archshell-core/archshell/schemas/config-v1.json`:
 
@@ -174,7 +176,17 @@ content:
 
 No other keys are allowed. Records are **append-only**: `archshell.adapters.records.append_record(root, …)` validates the record against `archshell-core/archshell/schemas/record-v1.json`, then creates the next file exclusively and never replaces or edits an existing one. Concurrent writers claim a `seq` by exclusive create of `.archshell/locks/records/<feature>/<seq>.claim` (gitignored, removed after the write), so each gets a distinct `seq`; the record is written to a temporary file, fsynced, and hard-linked into place, so it is either fully present or absent. A writer killed mid-write may leave a gap in the sequence. `read_records(root, feature)` returns a feature's records in `seq` order, each validated, and raises `InvalidRecord` naming the file when one fails the schema, is not a `<seq>-<flow>.yaml` name, or names a different feature, seq, or flow than its path. No command writes records yet; agents still cannot write under `.archshell/`.
 
-Until real feature workflows exist, two built-in flows exercise the action set: `probe` (`llm_task` → `ask` → `confirm` → `instruct_agent` → `done`) and `probe-report` (`llm_task` → `report`).
+Two built-in flows exercise the action set: `probe` (`llm_task` → `ask` → `confirm` → `instruct_agent` → `done`) and `probe-report` (`llm_task` → `report`). A `confirm` in them advances whatever the answer.
+
+### The `bootstrap` flow (selection tracer)
+
+`--feature bootstrap` (`/archshell:init` in Claude Code) goes from a developer's request to a recorded architecture: `ask` for the request → `llm_task` extracting the drivers (`archshell/drivers/v1`) → `confirm` of the proposal → `done` once the files are written, or `report` on a decline.
+
+- **Kept results.** A step's accepted result is kept in the state file's optional `results` field for the steps after it: `request` (the `ask` result), `drivers` (the parsed drivers), `proposal` (the proposal scored when the drivers were accepted: card id, title, patterns), and `confirmation` (the `confirm` result). The `llm_task` prompt carries the request; the `confirm` question and the written charter both use the kept `proposal`, never a re-scoring, so what is written is what the developer saw. A state file without `results` still loads; one whose `results` do not hold exactly the names kept before its step is `invalid_state`.
+- **Drivers.** The `llm_task` result stays `{"text": ...}` (`run.md`); the engine parses `text` as JSON and validates it against `archshell-core/archshell/schemas/drivers-v1.json` (closed: `domain_complexity`, `scale`, `audit_needs`, `read_write_asymmetry`, `deployment_model`, `team_size`, `integrations`, each an enum with `unknown`, and `modules`, a non-empty list of `{name, capabilities}` with unique ASCII PascalCase names). Text that is not JSON counts as an invalid output, retried like any other (`invalid_output` after the retries).
+- **Proposal.** Provisional, deterministic `Decimal` scoring over two fixed cards (`archshell.domain.scoring`, replaced in stories 2.3/2.4): Clean + Screaming when the drivers name two or more modules, Clean otherwise; ties break by card id.
+- **Writes.** Nothing is written before the `confirm` result is `{"confirmed": true}`; `{"confirmed": false}` ends in a `report` and writes nothing. On acceptance the engine renders `.archshell/charter/base.yaml` (request verbatim, every driver with `unknown` where the request does not establish it, modules with their capabilities, patterns, `decision: automatic`) and `architecture.yaml` (`language` of the installed language pack, `patterns`, module names, `versions.core` and `versions.packs.<distribution>` read with `importlib.metadata`), validates both against `charter-v1.json` and `architecture-v1.json`, creates the `.archshell/` layout, then records the planned writes (path, sha256, base64 backup of any previous bytes) in `.archshell/txn.json`, writes both files, and deletes the journal. Both files are English apart from the verbatim request, whatever `--lang` is.
+- **Refusals.** A `.archshell/txn.json` present when `bootstrap` starts a `next` or `submit` refuses with `bootstrap_interrupted` and writes nothing (rollback comes in story 2.9). No installed language pack refuses the write with `language_pack_missing`; a pack the loader refuses gives its own code (`incompatible_extension`, `duplicate_language`). With several packs installed, the first by `language` is used.
 
 ### Conversation language
 
@@ -184,7 +196,7 @@ The language is fixed when an action is issued: a repeated `next` returns the pe
 
 Texts live in per-language catalogs, `archshell-core/archshell/catalogs/en.yaml` and `es.yaml` (`schema: archshell/catalog/v1`, `lang`, and `messages`: a message key such as `flow.probe.ask.question` or `error.stale_action` mapped to a template with `{name}` placeholders; read as NFC). The domain names text only by key plus arguments; `archshell.adapters.catalogs` loads the files. Every catalog has the same keys with the same placeholders, and every key the code uses exists; `tests/test_messages.py` enforces both. Never localized: the `llm_task` prompt file and its retry text, the state file, records, config, logs, every other written file, and hook verdicts and hook errors (a hook gets no conversation language).
 
-Error codes (`archshell/error/v1`, exit code 2):
+Error codes (`archshell/error/v1`, exit code 2). They are one registry, `archshell.domain.errors.ERROR_CODES`; every code has an `error.<code>` entry in both catalogs, and `tests/test_error_registry.py` checks that every code the core raises is registered (hook verdict codes are not error codes) and that this table lists exactly the registry:
 
 | Code | Meaning |
 | --- | --- |
@@ -202,6 +214,11 @@ Error codes (`archshell/error/v1`, exit code 2):
 | `locked` | another invocation holds the feature's lock |
 | `invalid_state` | the state file is unreadable |
 | `invalid_config` | `submit` of an `llm_task` (or `next` during a retry cycle) found a `.archshell/config.yaml` that is not UTF-8, not restricted-subset YAML, or does not match `archshell/config/v1`; `details` holds `config` (the path) and `errors` (at most 10 `{path, message}` entries); the state is unchanged |
+| `extension_error` | an extension was refused at load (the base of the two codes below); `details` holds `entry_point`, `distribution`, and `reason` |
+| `incompatible_extension` | an extension does not implement the contract this core supports, or failed to load |
+| `duplicate_language` | two language packs claim the same `language`; `details` also holds `language` |
+| `bootstrap_interrupted` | `.archshell/txn.json` is present: an earlier journaled write stopped part-way; nothing is written |
+| `language_pack_missing` | the `bootstrap` write found no `archshell.language_packs` entry point; nothing is written |
 | `internal_error` | unexpected engine failure |
 
 On Windows machines where Application Control (Smart App Control) blocks unsigned executables, the uv launchers (`pytest.exe`, `archshell-engine.exe`) and the analyzer build output cannot start. Use the module forms instead: `uv run python -m pytest`, `echo '{}' | uv run python -m archshell.engine next --feature probe`.
@@ -295,7 +312,7 @@ export ARCHSHELL_ENGINE="uv run --project C:\git\arch-shell python -m archshell.
 $env:ARCHSHELL_ENGINE = "uv run --project C:\git\arch-shell python -m archshell.engine"
 ```
 
-`/archshell:ping` and `/archshell:run` both use it.
+`/archshell:ping`, `/archshell:run`, and `/archshell:init` all use it.
 
 ### Run a flow: `/archshell:run <feature>`
 
@@ -319,6 +336,12 @@ Try both built-in flows:
 ```
 
 Cursor state persists under `.archshell/` in the project root, so a finished flow keeps returning its terminal action; delete `.archshell/state/<feature>.yaml` to run it again.
+
+### Choose an architecture: `/archshell:init`
+
+`/archshell:init` runs the same loop (`archshell-claude-code/commands/init.md`) with the feature fixed to `bootstrap`: it asks what you are building, has an agent extract the drivers, shows the proposed architecture, and on your confirmation writes `.archshell/charter/base.yaml` and `architecture.yaml` (see "The `bootstrap` flow"). Declining writes nothing.
+
+`archshell-core/tests/test_bootstrap_flow.py` drives it with the scripted host (scripted request, drivers JSON, and confirmation) in `en` and `es`; the written files are byte-checked against the `bootstrap/...` entries of `golden/manifest.sha256`, with fixed version pins injected through `tests/pinned_engine.py`.
 
 ### End-to-end no-op flow (no Claude Code, no model)
 
