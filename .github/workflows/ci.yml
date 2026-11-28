@@ -65,6 +65,9 @@ jobs:
           uv run python -m pytest -v archshell-core/tests/test_no_op_flow.py
           uv run python -m pytest -v archshell-core/conformance/test_plugin_conformance.py -k engine_interface
 
+      - name: bootstrap flow (scripted host, request to charter and architecture.yaml, golden bytes)
+        run: uv run python -m pytest -v archshell-core/tests/test_bootstrap_flow.py archshell-core/tests/test_scoring.py archshell-core/tests/test_error_registry.py
+
       - name: build analyzer
         run: dotnet build archshell-dotnet/analyzer --configuration Release
 

@@ -29,7 +29,7 @@ from archshell.adapters.state_store import (
     RevisionConflict,
     StateStore,
 )
-from archshell.domain import hooks, layout, workflow
+from archshell.domain import charter, errors, hooks, layout, workflow
 from archshell.domain.actions import Message
 from archshell.domain.messages import DEFAULT_LANG, LANGUAGES, MessageError, msg
 from archshell.domain.messages import Message as CatalogMessage
@@ -132,9 +132,121 @@ def require_flow(feature: str) -> None:
         raise refuse(workflow.unknown_feature(feature))
 
 
+def bootstrap_interrupted() -> ProtocolError:
+    return ProtocolError(
+        "bootstrap_interrupted",
+        msg(errors.catalog_key("bootstrap_interrupted"), journal=layout.TXN),
+        {"journal": layout.TXN},
+    )
+
+
+def refuse_interrupted(feature: str, root: Path) -> None:
+    """A flow that writes files refuses to run while a write journal is present
+    (an earlier write stopped part-way); it is checked before the lock, so the
+    refusal writes nothing."""
+    from archshell.adapters import journal
+
+    if workflow.flow_has_effects(feature) and journal.present(root):
+        raise bootstrap_interrupted()
+
+
+def decode_json_text(result: Any) -> tuple[Any, list[tuple[str, str]]]:
+    """An `llm_task` result `{"text": ...}` (the `run.md` shape) whose text is a
+    JSON document -> (the parsed value, errors). A result that is not that
+    shape, or text that does not parse, is an output error the step retries."""
+    from archshell.adapters import output_schemas
+
+    found = output_schemas.validate(workflow.LLM_TEXT_SCHEMA, result)
+    if found:
+        return None, found
+    try:
+        return json.loads(result["text"]), []
+    except (json.JSONDecodeError, RecursionError) as exc:
+        return None, [("$.text", f"is not one JSON document: {exc}")]
+
+
+def extension_refusal(exc: Exception) -> ProtocolError:
+    """An extension the core refused to load, as its registered error code."""
+    from archshell.adapters.extensions import DuplicateLanguage
+
+    details: dict[str, Any] = {
+        "entry_point": exc.entry_point,  # type: ignore[attr-defined]
+        "distribution": exc.distribution,  # type: ignore[attr-defined]
+        "reason": str(exc),
+    }
+    code: str = exc.code  # type: ignore[attr-defined]
+    if isinstance(exc, DuplicateLanguage):
+        details["language"] = exc.language
+        message = msg(errors.catalog_key(code), language=exc.language)
+    else:
+        message = msg(
+            errors.catalog_key(code), entry_point=exc.entry_point, distribution=exc.distribution  # type: ignore[attr-defined]
+        )
+    return ProtocolError(code, message, details)
+
+
+def language_pack(found: Any = None) -> Any:
+    """The installed language pack, or a typed refusal.
+
+    With more than one installed, the first by `language` is used (a choice
+    between packs is not part of the tracer)."""
+    from archshell.adapters import extensions
+
+    try:
+        packs = extensions.language_packs(found=found)
+    except extensions.ExtensionError as exc:
+        raise extension_refusal(exc) from None
+    if not packs:
+        group = extensions.group_of("language_packs")
+        raise ProtocolError(
+            "language_pack_missing",
+            msg(errors.catalog_key("language_pack_missing"), group=group),
+            {"group": group},
+        )
+    return packs[min(packs)]
+
+
+def write_charter(root: Path, effect: charter.CharterWrite) -> None:
+    """Render and validate `base.yaml` and `architecture.yaml`, then write both
+    through the `.archshell/txn.json` journal."""
+    from archshell.adapters import journal, output_schemas, versions, yaml_read
+    from archshell.adapters.layout import create_layout
+    from archshell.render.yaml_emit import emit
+
+    pack = language_pack()
+    core_version, pack_versions = versions.pins(pack)
+    base = charter.base_document(effect.request, effect.drivers, effect.proposal)
+    architecture = charter.architecture_document(base, pack.language, core_version, pack_versions)
+    planned = []
+    for path, document, schema in (
+        (layout.BASE_CHARTER, base, charter.CHARTER_SCHEMA),
+        (layout.ARCHITECTURE, architecture, charter.ARCHITECTURE_SCHEMA),
+    ):
+        text = emit(document)
+        found = output_schemas.validate(schema, yaml_read.load(text))
+        if found:  # the domain built a document its own schema refuses: a defect
+            raise RuntimeError(f"{path} does not match {schema}: {found}")
+        planned.append(journal.PlannedWrite(path, text))
+    create_layout(root)
+    try:
+        journal.apply(root, planned)
+    except journal.JournalPresent:
+        raise bootstrap_interrupted() from None
+    log("charter_written", files=[write.path for write in planned])
+
+
+def apply_effect(root: Path, effect: Any) -> None:
+    """Execute a step's effect; the new state is written only after it succeeds."""
+    if isinstance(effect, charter.CharterWrite):
+        write_charter(root, effect)
+        return
+    raise TypeError(f"unknown effect: {effect!r}")
+
+
 def cmd_next(feature: str, message: Message, store: StateStore, lang: str) -> Message:
     del message  # `next` takes no input; everything comes from the state on disk.
     require_flow(feature)
+    refuse_interrupted(feature, store.root)
     with store.locked(feature):
         state = store.read(feature)
         # Only a state with retries in use needs `max_retries`; any other
@@ -200,6 +312,7 @@ def cmd_submit(feature: str, message: Message, store: StateStore, lang: str) -> 
     # Imported here so `next` and the hooks do not pay for loading jsonschema.
     from archshell.adapters import output_schemas
 
+    refuse_interrupted(feature, store.root)
     if store.read(feature) is None:
         # Refused before taking the lock, so the refusal creates no `.archshell/`
         # directory. State is written before any action reaches a host, so no
@@ -216,7 +329,7 @@ def cmd_submit(feature: str, message: Message, store: StateStore, lang: str) -> 
         outcome = workflow.on_submit(
             state, submission, fresh_ids(),
             validate=output_schemas.validate, render=catalogs.render, lang=lang,
-            **retries,
+            decode=decode_json_text, **retries,
         )
         if isinstance(outcome, workflow.Refusal):
             if outcome.code == "invalid_output":
@@ -227,6 +340,8 @@ def cmd_submit(feature: str, message: Message, store: StateStore, lang: str) -> 
                 )
             raise refuse(outcome)
         assert state is not None  # on_submit refuses when there is no state
+        if outcome.effect is not None:
+            apply_effect(store.root, outcome.effect)
         store.ensure_prompt(outcome.state)
         store.write(outcome.state, expected_revision=state.revision)
         store.discard_prompt(state, outcome.state)

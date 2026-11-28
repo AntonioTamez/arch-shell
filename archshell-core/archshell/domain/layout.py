@@ -11,6 +11,12 @@ ROOT = ".archshell"
 CONFIG = f"{ROOT}/config.yaml"
 GITIGNORE = f"{ROOT}/.gitignore"
 TXN = f"{ROOT}/txn.json"
+TXN_SCHEMA = "archshell/txn/v1"
+CHARTER_DIR = f"{ROOT}/charter"
+# The confirmed charter (committed) and the architecture rendered from it, at
+# the project root (story 2.1).
+BASE_CHARTER = f"{CHARTER_DIR}/base.yaml"
+ARCHITECTURE = "architecture.yaml"
 STATE_DIR = f"{ROOT}/state"
 LOCKS_DIR = f"{ROOT}/locks"
 # `llm_task` prompts live beside cursor state, one file per action id.
@@ -22,7 +28,7 @@ RECORD_CLAIMS_DIR = f"{LOCKS_DIR}/records"
 
 # Directories `create_layout` makes, in this order.
 DIRECTORIES: tuple[str, ...] = (
-    f"{ROOT}/charter",
+    CHARTER_DIR,
     f"{ROOT}/vocabulary",
     f"{ROOT}/features",
     RECORDS_DIR,

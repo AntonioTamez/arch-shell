@@ -7,7 +7,7 @@ entry-point groups `archshell.language_packs`, `archshell.providers`, or
 `extension_contract` equal to the contract version the core supports for its
 kind; a language pack must also expose `language`, and no two packs may claim
 the same one. Refusals are typed errors that name the entry point and its
-distribution. No engine or CLI command calls the loader yet.
+distribution. The `bootstrap` flow loads the language packs when it writes the charter.
 """
 
 from __future__ import annotations

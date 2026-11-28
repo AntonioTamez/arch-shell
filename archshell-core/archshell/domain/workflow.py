@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import hmac
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import Any
 
 from archshell.domain.actions import (
@@ -24,6 +25,7 @@ from archshell.domain.actions import (
     Report,
     action_from_message,
 )
+from archshell.domain import charter, scoring
 from archshell.domain.layout import DEFAULT_MAX_RETRIES, PROMPTS_DIR
 from archshell.domain.messages import DEFAULT_LANG, LANGUAGES, Message, Renderer, msg
 
@@ -31,6 +33,9 @@ STATE_SCHEMA = "archshell/state/v1"
 STATE_FIELDS = frozenset(
     {"schema", "feature", "flow", "step", "revision", "action", "attempts", "errors", "lang"}
 )
+# `results` (the kept results of earlier steps) is optional (AD-11): it is
+# written only once a step has kept one, and a state without it has none.
+RESULTS_FIELD = "results"
 # Older state shapes, read with defaults: before message catalogs (no `lang`),
 # and before retries (no `attempts`/`errors`, and no `lang` either).
 PRE_CATALOG_STATE_FIELDS = STATE_FIELDS - {"lang"}
@@ -54,6 +59,13 @@ MAX_ERROR_MESSAGE_LENGTH = 200
 # (schema id, result) -> schema errors as (path, message); empty when valid.
 # Supplied by an adapter, so the domain stays free of files and libraries.
 OutputValidator = Callable[[str, Any], Sequence[tuple[str, str]]]
+# An `llm_task` result -> (the value its `text` parses to, errors); errors are
+# empty when it parses. Supplied by the engine for `json_text` steps.
+TextDecoder = Callable[[Any], tuple[Any, Sequence[tuple[str, str]]]]
+
+# The kept results of earlier steps, by step name (`Step.name`).
+Results = Mapping[str, Any]
+NO_RESULTS: Results = MappingProxyType({})
 
 
 def is_valid_slug(value: Any) -> bool:
@@ -85,6 +97,29 @@ class Step:
     options: tuple[str, ...] = ()
     # `llm_task` only: the core schema id its result must match.
     output_schema: str = ""
+    # A named step keeps its accepted result in state under this name, for the
+    # steps after it; a `confirm`'s `on_decline` names the step to go to.
+    name: str = ""
+    # The catalog args of the step's main text (question, instruction, or
+    # summary), built from the earlier results.
+    args: Callable[[Results], Mapping[str, Any]] | None = None
+    # `llm_task` only: the prompt built from the earlier results, instead of `text`.
+    prompt: Callable[[Results], str] | None = None
+    # `llm_task` only: the result's `text` is JSON; its parsed value is what the
+    # output schema checks and what the step keeps.
+    json_text: bool = False
+    # `llm_task` only: checks of the (parsed) result the schema cannot state.
+    check: Callable[[Any], Sequence[tuple[str, str]]] | None = None
+    # `confirm` only: the step a `{"confirmed": false}` goes to. Empty: a
+    # decline advances like an accept (the probe flow).
+    on_decline: str = ""
+    # Issuing this step hands the engine shell this effect (built from the
+    # earlier results) to execute before the new state is written.
+    effect: Callable[[Results], Any] | None = None
+
+    def prompt_text(self, results: Results) -> str:
+        """An `llm_task`'s prompt: built from the results, else `text` itself."""
+        return self.prompt(results) if self.prompt is not None else self.text
 
 
 LLM_TEXT_SCHEMA = "archshell/llm-text/v1"
@@ -95,9 +130,66 @@ _PROBE_TASK = Step(
     output_schema=LLM_TEXT_SCHEMA,
 )
 
-# Built-in diagnostic flows; the feature slug selects the flow until real
-# feature workflows exist. `done` and `report` are terminal (AD-2).
+def _request(results: Results) -> str:
+    return results["request"]["answer"]
+
+
+def _proposal(results: Results) -> scoring.Proposal:
+    return scoring.propose(results["drivers"])
+
+
+def _proposal_args(results: Results) -> dict[str, str]:
+    return {
+        "patterns": _proposal(results).title,
+        "modules": ", ".join(charter.module_names(results["drivers"])),
+    }
+
+
+def _charter_write(results: Results) -> charter.CharterWrite:
+    return charter.CharterWrite(_request(results), results["drivers"], _proposal(results))
+
+
+# The selection tracer (story 2.1): the developer's request, its drivers, a
+# provisional proposal, and on confirmation the written charter.
+_BOOTSTRAP: tuple[Step, ...] = (
+    Step(
+        "ask",
+        "flow.bootstrap.ask.question",
+        header="flow.bootstrap.ask.header",
+        options=("flow.bootstrap.ask.example_modules", "flow.bootstrap.ask.example_single"),
+        name="request",
+    ),
+    Step(
+        "llm_task",
+        "",
+        output_schema=charter.DRIVERS_SCHEMA,
+        name="drivers",
+        prompt=lambda results: charter.drivers_prompt(_request(results)),
+        json_text=True,
+        check=charter.drivers_problems,
+    ),
+    Step(
+        "confirm",
+        "flow.bootstrap.confirm.question",
+        header="flow.bootstrap.confirm.header",
+        options=("flow.bootstrap.confirm.accept", "flow.bootstrap.confirm.decline"),
+        name="proposal",
+        args=_proposal_args,
+        on_decline="declined",
+    ),
+    Step(
+        "done",
+        "flow.bootstrap.done",
+        args=lambda results: {"patterns": _proposal(results).title},
+        effect=_charter_write,
+    ),
+    Step("report", "flow.bootstrap.declined", name="declined"),
+)
+
+# The feature slug selects the flow: `bootstrap` (story 2.1) and the built-in
+# diagnostic flows. `done` and `report` are terminal (AD-2).
 FLOWS: dict[str, tuple[Step, ...]] = {
+    "bootstrap": _BOOTSTRAP,
     "probe": (
         _PROBE_TASK,
         Step(
@@ -134,10 +226,28 @@ def prompt_file_for(action_id: str) -> str:
     return f"{PROMPTS_DIR}/{action_id}.md"
 
 
-def retry_prompt(step: Step, errors: Sequence[tuple[str, str]]) -> str:
+def flow_has_effects(flow: str) -> bool:
+    """True when a step of `flow` hands the engine shell an effect (a file write)."""
+    return any(step.effect is not None for step in FLOWS[flow])
+
+
+def step_index(flow: str, name: str) -> int:
+    """The index of the step called `name` in `flow`."""
+    for index, step in enumerate(FLOWS[flow]):
+        if step.name == name:
+            return index
+    raise ValueError(f"flow {flow!r} has no step named {name!r}")
+
+
+def retry_prompt(
+    step: Step, errors: Sequence[tuple[str, str]], results: Results = NO_RESULTS
+) -> str:
     """The step's prompt, then the errors its previous answer had."""
     lines = "".join(f"- {path}: {message}\n" for path, message in errors)
-    return f"{step.text}\n\nYour previous answer did not match {step.output_schema}:\n{lines}"
+    return (
+        f"{step.prompt_text(results)}\n\n"
+        f"Your previous answer did not match {step.output_schema}:\n{lines}"
+    )
 
 
 def cap_errors(errors: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
@@ -152,33 +262,41 @@ def error_entries(errors: Sequence[tuple[str, str]]) -> list[dict[str, str]]:
     return [{"path": path, "message": message} for path, message in errors]
 
 
-def step_texts(step: Step, lang: str, render: Renderer) -> dict[str, Any]:
-    """The step's developer-facing action fields, rendered in `lang`."""
+def step_texts(
+    step: Step, lang: str, render: Renderer, results: Results = NO_RESULTS
+) -> dict[str, Any]:
+    """The step's developer-facing action fields, rendered in `lang`. The main
+    text (question, instruction, or summary) takes the args the step builds
+    from the earlier results."""
 
-    def text(key: str) -> str:
-        return render(Message(key), lang)
+    def text(key: str, args: Mapping[str, Any] | None = None) -> str:
+        return render(Message(key, dict(args or {})), lang)
+
+    def main() -> str:
+        return text(step.text, step.args(results) if step.args is not None else None)
 
     match step.type:
         case "llm_task":
             return {}
         case "ask" | "confirm":
             return {
-                "question": text(step.text),
+                "question": main(),
                 "header": text(step.header),
                 "options": tuple(text(key) for key in step.options),
             }
         case "instruct_agent":
-            return {"instruction": text(step.text)}
+            return {"instruction": main()}
         case "report" | "done":
-            return {"summary": text(step.text)}
+            return {"summary": main()}
     raise ValueError(f"unknown step type: {step.type}")
 
 
 def build_action(
-    step: Step, feature: str, revision: int, ids: FreshIds, lang: str, render: Renderer
+    step: Step, feature: str, revision: int, ids: FreshIds, lang: str, render: Renderer,
+    results: Results = NO_RESULTS,
 ) -> Action:
     common = {"feature": feature, "action_id": ids.action_id, "revision": revision}
-    texts = step_texts(step, lang, render)
+    texts = step_texts(step, lang, render, results)
     match step.type:
         case "llm_task":
             return LlmTask(**common, prompt_file=prompt_file_for(ids.action_id))
@@ -227,6 +345,8 @@ class CursorState:
     attempts: int = 0
     errors: tuple[tuple[str, str], ...] = ()
     lang: str = DEFAULT_LANG
+    # The kept results of the earlier named steps (`Step.name`).
+    results: Results = NO_RESULTS
 
     @property
     def ended(self) -> bool:
@@ -244,18 +364,23 @@ class CursorState:
         from the current catalog in every language alike, so a catalog change
         (an engine upgrade mid-flow) shows the same way in English and Spanish.
         """
-        return replace(self.action, **step_texts(self.pending_step, self.lang, render))
+        return replace(
+            self.action, **step_texts(self.pending_step, self.lang, render, self.results)
+        )
 
     def pending_prompt(self) -> PromptFile | None:
         """The prompt file the pending action points at, or None if it has none."""
         if not isinstance(self.action, LlmTask):
             return None
         step = self.pending_step
-        text = retry_prompt(step, self.errors) if self.attempts else step.text
+        if self.attempts:
+            text = retry_prompt(step, self.errors, self.results)
+        else:
+            text = step.prompt_text(self.results)
         return PromptFile(self.action.prompt_file, text)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "schema": STATE_SCHEMA,
             "feature": self.feature,
             "flow": self.flow,
@@ -266,6 +391,9 @@ class CursorState:
             "errors": error_entries(self.errors),
             "lang": self.lang,
         }
+        if self.results:
+            data[RESULTS_FIELD] = dict(self.results)
+        return data
 
     @staticmethod
     def from_dict(data: Any) -> CursorState:
@@ -273,6 +401,8 @@ class CursorState:
             raise StateError("state must be an object")
         if data.get("schema") != STATE_SCHEMA:
             raise StateError(f"state schema must be {STATE_SCHEMA}")
+        results = data.get(RESULTS_FIELD, {})
+        data = {key: value for key, value in data.items() if key != RESULTS_FIELD}
         if set(data) == PRE_RETRY_STATE_FIELDS:
             # Written before retries existed: no retry is in progress, issued in English.
             data = {**data, "attempts": 0, "errors": [], "lang": DEFAULT_LANG}
@@ -315,7 +445,19 @@ class CursorState:
             or action.prompt_file != prompt_file_for(action.action_id)
         ):
             raise StateError("pending llm_task prompt_file does not match its action id")
-        return CursorState(feature, flow, step, revision, action, attempts, errors, lang)
+        kept = parse_state_results(results, flow, step)
+        return CursorState(feature, flow, step, revision, action, attempts, errors, lang, kept)
+
+
+def parse_state_results(value: Any, flow: str, step: int) -> Results:
+    """`results`: an object keyed by names of steps before the cursor."""
+    if not isinstance(value, dict):
+        raise StateError("results must be an object")
+    earlier = {s.name for s in FLOWS[flow][:step] if s.name}
+    unknown = sorted(str(key) for key in set(value) - earlier)
+    if unknown:
+        raise StateError(f"results name no earlier step: {', '.join(unknown)}")
+    return MappingProxyType(dict(value))
 
 
 def parse_state_errors(value: Any) -> tuple[tuple[str, str], ...]:
@@ -372,6 +514,8 @@ class Outcome:
     state: CursorState
     action: Action
     changed: bool
+    # What the issued step hands the engine shell to execute (`Step.effect`).
+    effect: Any = None
 
 
 def parse_submission(message: dict[str, Any]) -> Submission | Refusal:
@@ -416,11 +560,15 @@ def issue(
     render: Renderer,
     attempts: int = 0,
     errors: tuple[tuple[str, str], ...] = (),
+    results: Results = NO_RESULTS,
 ) -> Outcome:
     """Issue `step` of `flow`: the state holds it in English, the host gets it in `lang`."""
-    stored = build_action(FLOWS[flow][step], feature, revision, ids, DEFAULT_LANG, render)
-    state = CursorState(feature, flow, step, revision, stored, attempts, errors, lang)
-    return Outcome(state, state.issued(render), changed=True)
+    target = FLOWS[flow][step]
+    kept: Results = MappingProxyType(dict(results))
+    stored = build_action(target, feature, revision, ids, DEFAULT_LANG, render, kept)
+    state = CursorState(feature, flow, step, revision, stored, attempts, errors, lang, kept)
+    effect = target.effect(kept) if target.effect is not None else None
+    return Outcome(state, state.issued(render), changed=True, effect=effect)
 
 
 def on_next(
@@ -444,7 +592,8 @@ def on_next(
     if state is not None:
         if state.attempts and state.attempts >= max_retries:
             return issue(
-                state.flow, state.feature, state.step, state.revision + 1, ids, lang, render
+                state.flow, state.feature, state.step, state.revision + 1, ids, lang, render,
+                results=state.results,
             )
         return Outcome(state, state.issued(render), changed=False)
     if feature not in FLOWS:
@@ -485,6 +634,36 @@ def _invalid_output(
     )
 
 
+def _checked_output(
+    step: Step, result: dict[str, Any], validate: OutputValidator, decode: TextDecoder | None
+) -> tuple[Any, list[tuple[str, str]]]:
+    """An `llm_task` result's value (parsed, for a `json_text` step) and its errors."""
+    value: Any = result
+    if step.json_text:
+        if decode is None:
+            raise ValueError(f"step {step.name!r} needs a text decoder")
+        value, found = decode(result)
+        if found:
+            return None, list(found)
+    found = list(validate(step.output_schema, value))
+    if not found and step.check is not None:
+        found = list(step.check(value))
+    return value, found
+
+
+def _answer_refusal(step: Step, result: dict[str, Any]) -> Refusal | None:
+    """A named `ask` keeps a non-blank `answer`; a declinable `confirm` needs a
+    boolean `confirmed`."""
+    if step.type == "ask" and step.name:
+        answer = result.get("answer")
+        if not isinstance(answer, str) or not answer.strip():
+            return Refusal("invalid_message", msg("error.answer_not_text"))
+    if step.type == "confirm" and step.on_decline:
+        if not isinstance(result.get("confirmed"), bool):
+            return Refusal("invalid_message", msg("error.confirmed_not_boolean"))
+    return None
+
+
 def on_submit(
     state: CursorState | None,
     submission: Submission,
@@ -494,6 +673,7 @@ def on_submit(
     render: Renderer,
     lang: str = DEFAULT_LANG,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    decode: TextDecoder | None = None,
 ) -> Outcome | Refusal:
     """Accept a result for the pending action and advance, or refuse it.
 
@@ -501,6 +681,10 @@ def on_submit(
     the same step as a new `llm_task` (fresh id, next revision) whose prompt
     states the errors, at most `max_retries` times; the next invalid result is
     refused with `invalid_output` and the state stays as it is.
+
+    A named step's accepted result (for a `json_text` step, the parsed value)
+    is kept in state for the steps after it. A `{"confirmed": false}` for a
+    `confirm` with `on_decline` goes to that step instead of the next one.
     """
     if state is None or state.ended:
         return NO_PENDING_ACTION
@@ -516,14 +700,24 @@ def on_submit(
         return refusal
     current = FLOWS[state.flow][state.step]
     revision = state.revision + 1
+    value: Any = submission.result
     if current.output_schema:
-        found = list(validate(current.output_schema, submission.result))
+        value, found = _checked_output(current, submission.result, validate, decode)
         if found:
             errors = cap_errors(found)
             if state.attempts >= max_retries:
                 return _invalid_output(current.output_schema, len(found), errors, max_retries)
             return issue(
                 state.flow, state.feature, state.step, revision, ids, lang, render,
-                state.attempts + 1, errors,
+                state.attempts + 1, errors, state.results,
             )
-    return issue(state.flow, state.feature, state.step + 1, revision, ids, lang, render)
+    refusal = _answer_refusal(current, submission.result)
+    if refusal is not None:
+        return refusal
+    results: Results = state.results
+    if current.name:
+        results = {**results, current.name: value}
+    target = state.step + 1
+    if current.on_decline and submission.result["confirmed"] is False:
+        target = step_index(state.flow, current.on_decline)
+    return issue(state.flow, state.feature, target, revision, ids, lang, render, results=results)
