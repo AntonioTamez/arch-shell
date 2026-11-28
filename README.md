@@ -368,7 +368,11 @@ uv run python scripts/release_check.py v0.1.0-rc.1
 
 ### One-time setup
 
-1. **TestPyPI Trusted Publishing.** On TestPyPI, under *Your projects → Publishing*, add a pending publisher for each of `archshell` and `archshell-dotnet`: owner `AntonioTamez`, repository `arch-shell`, workflow `release.yml`, environment `testpypi`. No API token is stored anywhere.
+1. **TestPyPI Trusted Publishing.** No API token is stored anywhere. Every publisher uses owner `AntonioTamez`, repository `arch-shell`, workflow `release.yml`, environment `testpypi`. A project that does not exist yet needs a *pending* publisher (*Account settings → Publishing*, https://test.pypi.org/manage/account/publishing/), and TestPyPI accepts only one pending publisher with that configuration, so the first release takes two steps:
+   1. Add a pending publisher for `archshell` only, then push the tag. The `publish` job uploads `archshell` (the upload runs in file-name order) and fails on `archshell-dotnet`, which has no publisher yet: `400 Non-user identities cannot create new projects`.
+   2. Now that `archshell` exists, add the pending publisher for `archshell-dotnet` and re-run the failed jobs. The re-run skips the files already uploaded.
+
+   A pending publisher does not reserve the name: until the first upload creates the project, anyone can create it. Once both projects exist, later releases need no setup.
 2. **GitHub environment.** In the repository settings, create the environment `testpypi` (optionally restrict it to tags `v*`).
 3. **Signing key.** Register your GPG or SSH signing key on GitHub (*Settings → SSH and GPG keys*, as a signing key) and configure git to sign tags with it (`git config user.signingkey …`; for SSH also `git config gpg.format ssh`).
 4. **GitHub Packages.** Nothing to create: the first publish creates `Archshell.Analyzer`, linked to this repository through the csproj `RepositoryUrl`. Reading it needs a token with `read:packages`, even though the package is public.
